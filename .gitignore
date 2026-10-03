@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# 浏览器用户数据目录（含登录态，不要提交）
+browser_data/
