@@ -317,9 +317,18 @@ class GUI:
         pass  # 不再需要overrideredirect
 
     def _close(s):
-        """关闭窗口"""
+        """关闭窗口（先停任务并等待浏览器关闭，避免残留 chrome 进程/锁文件）"""
         if s.bot:
             s.bot.stop()
+        # 等待运行线程退出（daemon 线程随 destroy 硬杀会导致 Playwright
+        # 来不及关闭浏览器 → 残留 chrome.exe + SingletonLock，下次启动 exitCode=21）
+        if s.th and s.th.is_alive():
+            s.th.join(timeout=10)
+        if s.bot:
+            try:
+                s.bot.close()
+            except Exception:
+                pass
         if s.tray_icon:
             try:
                 s.tray_icon.stop()

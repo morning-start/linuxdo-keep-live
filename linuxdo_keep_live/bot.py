@@ -390,11 +390,24 @@ class Bot:
     # ---------------- 防风控 ----------------
 
     def _random_delay(self, min_sec=0.5, max_sec=2.0, reason=""):
-        """防风控：随机延迟"""
+        """防风控：随机延迟
+
+        分段睡眠并检查 self.run：点停止后最长 0.5 秒内响应，
+        而不是睡完整个随机延迟（可能长达十几秒）。
+        """
         delay = random.uniform(min_sec, max_sec)
         if reason:
             self.lg(f"[防风控] {reason}，等待 {delay:.1f}s")
-        time.sleep(delay)
+        self._wait_seconds(delay)
+
+    def _wait_seconds(self, seconds):
+        """分段睡眠，期间任务被停止/达标时立即返回"""
+        end = time.time() + seconds
+        while self.run:
+            remain = end - time.time()
+            if remain <= 0:
+                break
+            time.sleep(min(0.5, remain))
 
     # ---------------- 浏览器管理 ----------------
 
@@ -958,9 +971,8 @@ class Bot:
                 self.run = False
                 break
 
-            # 等待阅读（2-4秒）
-            wait_time = random.uniform(2, 4)
-            time.sleep(wait_time)
+            # 等待阅读（2-4秒，可被停止打断）
+            self._wait_seconds(random.uniform(2, 4))
 
             # 滚动页面（600-1200px）
             scroll_distance = random.randint(600, 1200)
@@ -968,7 +980,7 @@ class Bot:
             scroll_count += 1
 
             # 等待页面更新
-            time.sleep(0.5)
+            self._wait_seconds(0.5)
 
             # 获取当前楼层
             floor_info = self.get_floor_info()
@@ -997,7 +1009,7 @@ class Bot:
                     if stuck_count >= 3:
                         self.lg("楼层卡住，加大滚动距离")
                         self.pg.evaluate(f"window.scrollBy(0, 1500)")
-                        time.sleep(1)
+                        self._wait_seconds(1)
                         stuck_count = 0
 
             # 安全检查：避免无限循环
@@ -1023,7 +1035,7 @@ class Bot:
             for i in range(3):
                 if not self.run:
                     break
-                time.sleep(random.uniform(1, 2))
+                self._wait_seconds(random.uniform(1, 2))
                 self.pg.evaluate(f"window.scrollBy(0, {random.randint(400, 800)})")
             self.stats["floors"] += 3
             if self.update_progress:
@@ -1048,15 +1060,15 @@ class Bot:
             and current_floor < total_floors
             and self.run
         ):
-            # 快速等待（1-2秒）
-            time.sleep(random.uniform(1, 2))
+            # 快速等待（1-2秒，可被停止打断）
+            self._wait_seconds(random.uniform(1, 2))
 
             # 滚动页面
             scroll_distance = random.randint(400, 800)
             self.pg.evaluate(f"window.scrollBy(0, {scroll_distance})")
             scroll_count += 1
 
-            time.sleep(0.3)
+            self._wait_seconds(0.3)
 
             # 获取当前楼层
             floor_info = self.get_floor_info()
@@ -1093,7 +1105,7 @@ class Bot:
         while time.time() - start < duration and self.run:
             dist = random.randint(150, 400)
             self.pg.evaluate(f"window.scrollBy(0, {dist})")
-            time.sleep(random.uniform(1.0, 3.0))
+            self._wait_seconds(random.uniform(1.0, 3.0))
 
             at_bottom = self.pg.evaluate(JS_AT_BOTTOM)
             if at_bottom:
@@ -1232,15 +1244,22 @@ class Bot:
 
             self.lg(f"找到 {btn_count} 个点赞按钮")
 
-            # 随机点赞主帖（检查开关）
-            if self.enable_like and btn_count > 0 and random.random() < self.cfg["like_rate"]:
+            # 随机点赞主帖（检查开关；达标停止后不再执行互动动作）
+            if (
+                self.run
+                and self.enable_like
+                and btn_count > 0
+                and random.random() < self.cfg["like_rate"]
+            ):
                 self.do_like(0)
                 if self.enable_wait:
                     self._random_delay(self.cfg["wait_min"], self.cfg["wait_max"], "点赞后休息")
 
             # 随机点赞回复（检查开关）
-            if self.enable_like and btn_count > 1:
+            if self.run and self.enable_like and btn_count > 1:
                 for i in range(1, min(btn_count, 5)):
+                    if not self.run:
+                        break
                     if random.random() < self.cfg["like_reply_rate"]:
                         self.do_like(i)
                         if self.enable_wait:
@@ -1249,7 +1268,7 @@ class Bot:
                             )
 
             # 随机回帖（检查开关）
-            if self.enable_reply and random.random() < self.cfg["reply_rate"]:
+            if self.run and self.enable_reply and random.random() < self.cfg["reply_rate"]:
                 if self.enable_wait:
                     self._random_delay(self.cfg["wait_min"], self.cfg["wait_max"], "准备回帖")
                 self.do_reply()
@@ -1300,8 +1319,13 @@ class Bot:
             return
 
         elapsed_time = time.time() - self.start_time
-        elapsed_minutes = int(elapsed_time / 60)
+        elapsed_minutes = int(elapsed_time // 60)
         elapsed_seconds = int(elapsed_time % 60)
+        # 超过 1 小时显示 H:MM:SS，否则 M:SS
+        if elapsed_minutes >= 60:
+            elapsed_str = f"{elapsed_time / 3600:.0f}:{elapsed_minutes % 60:02d}:{elapsed_seconds:02d}"
+        else:
+            elapsed_str = f"{elapsed_minutes}:{elapsed_seconds:02d}"
 
         # 根据浏览模式计算已读数
         if self.browse_mode == "quick":
@@ -1317,7 +1341,7 @@ class Bot:
 
         if self.mode == "topics":
             remaining = self.target_value - total_read
-            text = f"剩余: {remaining} | 已读: {total_read} ({read_desc}) | 用时: {elapsed_minutes}:{elapsed_seconds:02d}"
+            text = f"剩余: {remaining} | 已读: {total_read} ({read_desc}) | 用时: {elapsed_str}"
         elif self.mode == "time":
             elapsed_secs = elapsed_time
             remaining_secs = self.target_value * 60 - elapsed_secs
@@ -1328,7 +1352,7 @@ class Bot:
             else:
                 text = f"已超时 | 已读: {total_read} ({read_desc})"
         else:  # endless
-            text = f"用时: {elapsed_minutes}:{elapsed_seconds:02d} | 已读: {total_read} ({read_desc})"
+            text = f"用时: {elapsed_str} | 已读: {total_read} ({read_desc})"
 
         self.update_countdown(text)
 

@@ -37,7 +37,7 @@ from .config import CATS, DEFAULT_CONFIG
 # 每次任务的帖子数范围（分钟级随机，模拟真人使用习惯）
 DEFAULT_TOPICS_RANGE = (15, 40)
 
-# 随机运行时间段（每天 7:00 - 23:00 之间）
+# 随机运行时间段（每天 7:00 - 23:00 之间随机取点，含 22:59）
 SCHEDULE_HOUR_RANGE = (7, 22)
 
 
@@ -99,6 +99,7 @@ class DockerBot:
         self.block_images = block_images
         self.user_data_dir = user_data_dir
         self.log = logger or Log()
+        self.current_bot = None  # 当前运行中的 Bot 实例（信号处理用）
 
     def _make_bot(self, target_topics):
         """构造一次性的 Bot 实例"""
@@ -133,12 +134,14 @@ class DockerBot:
         self.log.info("=" * 50)
 
         bot = self._make_bot(target_topics)
+        self.current_bot = bot
         start = time.time()
 
         try:
             bot.run_session(username=self.username, password=self.password)
         finally:
             bot.close()
+            self.current_bot = None
 
         elapsed = int(time.time() - start)
         self.log.info("=" * 50)
@@ -160,9 +163,14 @@ class RandomScheduler:
         self.topics_range = topics_range
         self.today_schedule = []
         self.running = True
+        self._ran_today = False  # 今天是否已执行过任务（补跑判断用）
 
     def _generate_daily_schedule(self):
-        """生成今天的随机运行时间"""
+        """生成今天的随机运行时间
+
+        若生成的有效时间点为 0（启动太晚，如 22:00 后），
+        且今天还没跑过任务，则当日再补跑一次（30-90 分钟内随机触发）。
+        """
         now = datetime.now()
         today = now.replace(hour=0, minute=0, second=0, microsecond=0)
         times = []
@@ -177,6 +185,17 @@ class RandomScheduler:
                 times.append(run_time)
 
         times.sort()
+
+        # 傍晚启动且一个未来时间点都没有：当天补跑一次，避免闲一整天
+        if not times and not self._ran_today and now.hour < 23:
+            catch_up = now + timedelta(minutes=random.randint(30, 90))
+            if catch_up.hour < 23:
+                times.append(catch_up)
+                self.bot.log.info(
+                    f"今日计划时间已过，安排补跑: {catch_up.strftime('%H:%M')}"
+                )
+
+        self._ran_today = False
         self.today_schedule = times
 
         self.log_schedule()
@@ -186,14 +205,16 @@ class RandomScheduler:
     def log_schedule(self):
         self.bot.log.info(f"今日计划 ({len(self.today_schedule)} 次):")
         for t in self.today_schedule:
-            topics = random.randint(*self.topics_range)
-            self.bot.log.info(f"  {t.strftime('%H:%M')} - 浏览约 {topics} 个帖子")
+            self.bot.log.info(f"  {t.strftime('%H:%M')} - 浏览随机数量的帖子")
 
     def _run_task(self):
-        """执行一次任务"""
+        """执行一次任务（异常隔离：单次失败不影响常驻调度）"""
         topics = random.randint(*self.topics_range)
         self.bot.log.info(f"定时任务触发 | 目标 {topics} 个帖子")
-        self.bot.run_once(target_topics=topics)
+        try:
+            self.bot.run_once(target_topics=topics)
+        except Exception as e:
+            self.bot.log.err(f"任务异常（调度器继续运行）: {e}")
 
     def start(self):
         """启动调度器"""
@@ -241,6 +262,7 @@ class RandomScheduler:
 
                 if self.running:
                     self._run_task()
+                    self._ran_today = True
 
             # 今天的计划执行完毕，等到明天
             if self.running:
@@ -282,16 +304,16 @@ def parse_args(argv=None):
     parser.add_argument("-u", "--username", help="用户名")
     parser.add_argument("-p", "--password", help="密码")
     parser.add_argument(
-        "--like-rate", type=int, default=30, help="点赞概率 0-100，默认 30"
+        "--like-rate", type=int, default=None, help="点赞概率 0-100（默认 30，或环境变量 LIKE_RATE）"
     )
     parser.add_argument(
-        "--runs-per-day", type=int, default=2, help="每天运行次数，默认 2"
+        "--runs-per-day", type=int, default=None, help="每天运行次数（默认 2，或环境变量 RUNS_PER_DAY）"
     )
     parser.add_argument(
-        "--topics-min", type=int, default=15, help="每次最少浏览帖子数，默认 15"
+        "--topics-min", type=int, default=None, help="每次最少浏览帖子数（默认 15，或环境变量 TOPICS_MIN）"
     )
     parser.add_argument(
-        "--topics-max", type=int, default=40, help="每次最多浏览帖子数，默认 40"
+        "--topics-max", type=int, default=None, help="每次最多浏览帖子数（默认 40，或环境变量 TOPICS_MAX）"
     )
     parser.add_argument(
         "--proxy", help="代理地址，如 127.0.0.1:7897（或环境变量 LINUXDO_PROXY）"
@@ -330,11 +352,20 @@ def main(argv=None):
 
     proxy = args.proxy or os.environ.get("LINUXDO_PROXY")
 
+    # 参数优先级：命令行 > 环境变量 > 默认值
+    def _pick(arg_val, env_key, default):
+        if arg_val is not None:
+            return arg_val
+        env = os.environ.get(env_key)
+        if env:
+            return env
+        return default
+
     try:
-        like_rate = int(args.like_rate or os.environ.get("LIKE_RATE", "30"))
-        runs_per_day = int(args.runs_per_day or os.environ.get("RUNS_PER_DAY", "2"))
-        topics_min = int(args.topics_min or os.environ.get("TOPICS_MIN", "15"))
-        topics_max = int(args.topics_max or os.environ.get("TOPICS_MAX", "40"))
+        like_rate = int(_pick(args.like_rate, "LIKE_RATE", 30))
+        runs_per_day = int(_pick(args.runs_per_day, "RUNS_PER_DAY", 2))
+        topics_min = int(_pick(args.topics_min, "TOPICS_MIN", 15))
+        topics_max = int(_pick(args.topics_max, "TOPICS_MAX", 40))
     except ValueError as e:
         logger.err(f"参数解析失败: {e}")
         sys.exit(1)
@@ -368,6 +399,12 @@ def main(argv=None):
         def handle_signal(sig, frame):
             logger.info("收到停止信号，正在退出...")
             scheduler.stop()
+            # 同时停掉正在运行的任务，避免 Ctrl+C 后浏览器继续跑完整个任务
+            if bot.current_bot is not None:
+                try:
+                    bot.current_bot.stop()
+                except Exception:
+                    pass
 
         signal.signal(signal.SIGTERM, handle_signal)
         signal.signal(signal.SIGINT, handle_signal)

@@ -10,7 +10,7 @@
     python main.py cli -u 用户名 -p 密码
     python main.py cli -u 用户名 -p 密码 --topics 50 --like-rate 20
     python main.py cli -u 用户名 -p 密码 --proxy 127.0.0.1:7897
-    python main.py cli -u 用户名 -p 密码 --browse-mode quick --threaded
+    python main.py cli -u 用户名 -p 密码 --browse-mode quick
 
 环境变量：
     LINUXDO_USERNAME  用户名
