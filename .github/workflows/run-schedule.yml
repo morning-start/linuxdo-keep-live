@@ -149,10 +149,15 @@ jobs:
       # 配了 CLASH_SUB 才启用；跑完后浏览器走 http://127.0.0.1:7897
       # ======================================================================
       - name: Setup Clash proxy (mihomo)
-        if: ${{ secrets.CLASH_SUB != '' }}
         env:
           CLASH_SUB: ${{ secrets.CLASH_SUB }}
         run: |
+          # 未配置订阅时跳过（secrets 不能用于 if 条件，这里在 shell 里判断）
+          if [ -z "$CLASH_SUB" ]; then
+            echo "未配置 CLASH_SUB Secret，跳过代理设置"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
           set -e
           # ---- 下载 mihomo 内核（固定版本，保证可复现） ----
           MIHOMO_VER="v1.19.32"
