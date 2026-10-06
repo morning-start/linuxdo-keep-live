@@ -165,6 +165,29 @@ jobs:
           gunzip -f mihomo.gz && chmod +x mihomo
           ./mihomo -v
 
+          # ---- 预检订阅链接：常见复制错误在这里就能发现 ----
+          # 一键导入链接（clash://install-config?url=...）不是订阅本身，内核拉不了
+          if [[ "$CLASH_SUB" == clash://* ]]; then
+            echo "::error::CLASH_SUB 填的是 clash:// 一键导入链接，请改填原始订阅地址（https:// 开头，Clash Verge 里「编辑订阅」可看到真实 URL）"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          if [[ "$CLASH_SUB" != https://* && "$CLASH_SUB" != http://* ]]; then
+            echo "::error::CLASH_SUB 不是有效的 http(s) 订阅链接（当前前缀: ${CLASH_SUB:0:8}...）"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          # 预拉一次订阅验证可达（-w 输出状态码；UA 伪装 Clash Verge，很多机场按 UA 发不同格式）
+          SUB_CODE=$(curl -sL -o /tmp/sub_probe.yaml -w '%{http_code}' --max-time 20 \
+            -A "clash-verge/v1.7.7" "$CLASH_SUB" || echo 000)
+          SUB_SIZE=$(wc -c < /tmp/sub_probe.yaml 2>/dev/null || echo 0)
+          echo "订阅预检: HTTP $SUB_CODE, ${SUB_SIZE} 字节"
+          if [ "$SUB_CODE" != "200" ] || [ "$SUB_SIZE" -lt 50 ]; then
+            echo "::error::订阅链接拉取失败（HTTP $SUB_CODE）——链接过期/需要登录/机场风控，浏览器里打开该链接验证"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
           # ---- 生成最小配置：本地 mixed 端口 7897 + 订阅作为 provider ----
           # 规则模式 + MATCH 全走 PROXY 组；不启用 TUN/系统代理，仅本地端口
           # （用 printf 逐行写入，避免 heredoc 结束符与 YAML 块标量缩进冲突）
@@ -173,7 +196,7 @@ jobs:
             echo 'mixed-port: 7897'
             echo 'allow-lan: false'
             echo 'mode: rule'
-            echo 'log-level: warning'
+            echo 'log-level: info'
             echo 'external-controller: 127.0.0.1:9090'
             echo 'proxy-providers:'
             echo '  sub:'
@@ -181,6 +204,9 @@ jobs:
             echo '    url: "CLASH_SUB_PLACEHOLDER"'
             echo '    path: sub.yaml'
             echo '    interval: 86400'
+            echo '    header:'
+            echo '      User-Agent:'
+            echo '        - clash-verge/v1.7.7'
             echo '    health-check:'
             echo '      enable: true'
             echo '      url: https://www.gstatic.com/generate_204'
@@ -209,11 +235,17 @@ jobs:
               PORT_OK=1
               break
             fi
+            # 进程已退出就直接放弃，不用等满 15 轮
+            if ! kill -0 $(pgrep -f "mihomo -d" | head -1) 2>/dev/null; then
+              echo "mihomo 进程已退出"
+              break
+            fi
             echo "等待 mihomo 启动... ($i/15)"
             sleep 2
           done
           if [ "$PORT_OK" != "1" ]; then
-            echo "::warning::mihomo 启动失败（订阅链接可能无效），浏览任务将直连"
+            echo "::warning::mihomo 启动失败，日志如下（Secret 值已被 GitHub 自动打码）："
+            cat mihomo-work/mihomo.log || true
             echo "PROXY_PASS=0" >> $GITHUB_ENV
             exit 0
           fi
@@ -240,7 +272,9 @@ jobs:
             echo "✅ 代理自检通过，浏览任务将走 Clash 节点"
           else
             echo "PROXY_PASS=0" >> $GITHUB_ENV
-            echo "::warning::代理自检未通过（所有节点都无法打开 linux.do），浏览任务将直连重试"
+            echo "::warning::代理自检未通过（所有节点都无法打开 linux.do），日志如下："
+            tail -n 30 mihomo-work/mihomo.log || true
+            echo "::warning::浏览任务将直连重试"
           fi
 
       # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
