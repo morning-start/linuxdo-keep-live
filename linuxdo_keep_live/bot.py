@@ -318,6 +318,65 @@ def is_proxy_error(error):
     )
 
 
+# 运行目标解析：把 "30" / "30min" / "1h" 这类目标字符串解析为 (mode, target_value)。
+# 带时间单位 = 按时间运行；纯数字 = 按帖子数量运行；识别不了走默认（30 分钟）。
+TARGET_DEFAULT = ("time", 30)  # 识别不了时的默认目标：30 分钟
+
+
+def parse_target(value, default=None):
+    """解析运行目标字符串，返回 (mode, target_value)。
+
+    规则：
+        - "30"      -> ("topics", 30)   按 30 个帖子
+        - "30min"   -> ("time", 30)     按 30 分钟
+        - "1h"      -> ("time", 60)     按 1 小时
+        - "90s"     -> ("time", 1.5)    按 90 秒
+        - "" / None / 识别不了 -> default（默认 30 分钟）
+
+    支持的单位：min/m/分钟（分钟），h/小时（小时），s/秒（秒）。
+    数量支持纯数字或带 "帖"/"个"/"topics" 后缀。
+    """
+    if default is None:
+        default = TARGET_DEFAULT
+
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if not s:
+        return default
+
+    # 提取数字部分（整数或小数）与单位部分
+    import re
+
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(.*)$", s)
+    if not m:
+        return default
+    num = float(m.group(1))
+    unit = m.group(2).strip()
+
+    if unit in ("", "帖", "个", "topic", "topics"):
+        if num <= 0 or num != int(num):
+            return default
+        return ("topics", int(num))
+
+    if unit in ("min", "mins", "m", "分钟"):
+        if num <= 0:
+            return default
+        return ("time", num)
+
+    if unit in ("h", "hr", "hour", "hours", "小时"):
+        if num <= 0:
+            return default
+        return ("time", num * 60)
+
+    if unit in ("s", "sec", "secs", "秒"):
+        if num <= 0:
+            return default
+        return ("time", num / 60)
+
+    return default
+
+
 # 代理失败时给出的可操作提示
 PROXY_FAIL_HINT = (
     "代理连接失败：请检查代理软件是否正在运行、端口是否正确；"

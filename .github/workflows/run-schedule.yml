@@ -27,7 +27,8 @@
 #
 # 4. 运行
 #    - 手动触发：Actions -> Run Schedule -> Run workflow（可填参数）
-#    - 定时触发：按下方 schedule cron 自动运行
+#      「运行目标」填纯数字 = 浏览 N 个帖子（30）；带单位 = 按时长（30min / 1h）
+#    - 定时触发：按下方 schedule cron 自动运行，默认 30min
 #
 # ================================================================================
 # 定时规则说明
@@ -55,10 +56,10 @@ on:
   # 手动触发
   workflow_dispatch:
     inputs:
-      topics:
-        description: '浏览帖子数量'
+      target:
+        description: '运行目标：纯数字=帖子数（30=30帖），带单位=时长（30min/1h）'
         required: false
-        default: '30'
+        default: '30min'
       like_rate:
         description: '点赞概率 (0-100)'
         required: false
@@ -127,20 +128,20 @@ jobs:
           PYTHONUNBUFFERED: '1'
         run: |
           # 获取参数（手动触发时使用输入值，定时触发时使用默认值）
-          TOPICS="${{ github.event.inputs.topics || '30' }}"
+          TARGET="${{ github.event.inputs.target || '30min' }}"
           LIKE_RATE="${{ github.event.inputs.like_rate || '30' }}"
           BROWSE_MODE="${{ github.event.inputs.browse_mode || 'deep' }}"
 
           echo "========================================"
           echo "开始运行 Linux.do 自动浏览 (CloakBrowser)"
-          echo "目标帖子数: $TOPICS"
+          echo "运行目标: $TARGET（纯数字=帖子数，带单位=时长）"
           echo "点赞概率: $LIKE_RATE%"
           echo "浏览模式: $BROWSE_MODE"
           echo "========================================"
 
           # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
           uv run python main.py cli \
-            --topics "$TOPICS" \
+            --target "$TARGET" \
             --like-rate "$LIKE_RATE" \
             --browse-mode "$BROWSE_MODE"
 

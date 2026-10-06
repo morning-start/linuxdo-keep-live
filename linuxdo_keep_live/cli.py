@@ -8,7 +8,8 @@
 
 用法：
     python main.py cli -u 用户名 -p 密码
-    python main.py cli -u 用户名 -p 密码 --topics 50 --like-rate 20
+    python main.py cli -u 用户名 -p 密码 --target 50 --like-rate 20
+    python main.py cli -u 用户名 -p 密码 --target 1h
     python main.py cli -u 用户名 -p 密码 --proxy 127.0.0.1:7897
     python main.py cli -u 用户名 -p 密码 --browse-mode quick
 
@@ -16,6 +17,7 @@
     LINUXDO_USERNAME  用户名
     LINUXDO_PASSWORD  密码
     LINUXDO_PROXY     代理地址（可选）
+    LINUXDO_TARGET    运行目标（同 --target，默认 30min）
 
 浏览器：
     基于 CloakBrowser（Playwright drop-in 隐身 Chromium）。
@@ -29,7 +31,7 @@ import sys
 from datetime import datetime
 
 from . import __version__
-from .bot import Bot
+from .bot import Bot, parse_target
 from .config import CATS, DEFAULT_CONFIG
 
 
@@ -78,14 +80,16 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python main.py cli -u myuser -p mypass
-  python main.py cli -u myuser -p mypass --topics 50
+  python main.py cli -u myuser -p mypass                # 默认 30 分钟
+  python main.py cli -u myuser -p mypass --target 50    # 浏览 50 个帖子
+  python main.py cli -u myuser -p mypass --target 1h    # 运行 1 小时
   python main.py cli -u myuser -p mypass --proxy 127.0.0.1:7897
 
 环境变量:
   LINUXDO_USERNAME  用户名
   LINUXDO_PASSWORD  密码
   LINUXDO_PROXY     代理地址（可选）
+  LINUXDO_TARGET    运行目标（同 --target，默认 30min）
         """,
     )
 
@@ -100,7 +104,16 @@ def parse_args(argv=None):
         help="Linux.do 密码（或设置环境变量 LINUXDO_PASSWORD）",
     )
     parser.add_argument("--proxy", help="代理地址，如 127.0.0.1:7897")
-    parser.add_argument("--topics", type=int, default=30, help="浏览帖子数量，默认 30")
+    parser.add_argument(
+        "--target",
+        "--topics",
+        dest="target",
+        default=None,
+        help=(
+            "运行目标：带时间单位=按时间运行（30min/1h/45分钟），"
+            "纯数字=按帖子数量（30/50帖）；默认 30min（或环境变量 LINUXDO_TARGET）"
+        ),
+    )
     parser.add_argument(
         "--like-rate", type=int, default=30, help="点赞概率（0-100），默认 30"
     )
@@ -138,6 +151,8 @@ def main(argv=None):
     username = args.username or os.environ.get("LINUXDO_USERNAME")
     password = args.password or os.environ.get("LINUXDO_PASSWORD")
     proxy = args.proxy or os.environ.get("LINUXDO_PROXY")
+    # 运行目标：命令行 > 环境变量 > 默认 30min
+    target_str = args.target or os.environ.get("LINUXDO_TARGET") or "30min"
 
     # 验证必要参数
     if not username or not password:
@@ -162,13 +177,16 @@ def main(argv=None):
     cfg["like_rate"] = args.like_rate / 100  # 转换为小数
     cfg["block_images"] = not args.load_images
 
+    # 解析运行目标："30"=30帖，"30min"=30分钟，"1h"=1小时，识别不了走默认 30min
+    mode, target_value = parse_target(target_str)
+
     # 创建机器人并运行
     bot = Bot(
         cfg,
         CATS,
         logger.info,
-        mode="topics",
-        target_value=args.topics,
+        mode=mode,
+        target_value=target_value,
         enable_like=True,
         enable_reply=False,  # 无头版默认不自动回帖（避免被检测）
         enable_wait=True,
@@ -180,7 +198,10 @@ def main(argv=None):
     )
 
     logger.info(f"Linux.do 自动浏览任务开始 (v{__version__}, CloakBrowser)")
-    logger.info(f"目标: 浏览 {args.topics} 个帖子，浏览模式: {args.browse_mode}")
+    if mode == "topics":
+        logger.info(f"目标: 浏览 {target_value} 个帖子，浏览模式: {args.browse_mode}")
+    else:
+        logger.info(f"目标: 运行 {target_value:g} 分钟，浏览模式: {args.browse_mode}")
 
     try:
         bot.run_session(username=username, password=password)

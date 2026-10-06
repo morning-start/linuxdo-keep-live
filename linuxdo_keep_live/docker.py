@@ -16,8 +16,10 @@
     LINUXDO_PROXY     代理地址（可选）
     LIKE_RATE         点赞概率（0-100，默认 30）
     RUNS_PER_DAY      每天运行次数（默认 2）
-    TOPICS_MIN        每次最少浏览帖子数（默认 15）
-    TOPICS_MAX        每次最多浏览帖子数（默认 40）
+    LINUXDO_TARGET    任务目标："30"=30帖 / "30min"=30分钟 / "1h"=1小时
+                      （默认不设置 = 每次随机 15-40 帖）
+    TOPICS_MIN        每次最少浏览帖子数（默认 15，仅未设 LINUXDO_TARGET 时生效）
+    TOPICS_MAX        每次最多浏览帖子数（默认 40，仅未设 LINUXDO_TARGET 时生效）
     CHROME_USER_DATA  用户数据目录（默认 ./browser_data）
     RUN_ON_START      首次启动是否立即运行一次（默认 true）
     DEBUG             调试日志
@@ -31,7 +33,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import __version__
-from .bot import Bot
+from .bot import Bot, parse_target
 from .config import CATS, DEFAULT_CONFIG
 
 # 每次任务的帖子数范围（分钟级随机，模拟真人使用习惯）
@@ -101,8 +103,12 @@ class DockerBot:
         self.log = logger or Log()
         self.current_bot = None  # 当前运行中的 Bot 实例（信号处理用）
 
-    def _make_bot(self, target_topics):
-        """构造一次性的 Bot 实例"""
+    def _make_bot(self, mode, target_value):
+        """构造一次性的 Bot 实例
+
+        mode: "topics"（按帖子数）或 "time"（按分钟）
+        target_value: 帖子数或分钟数
+        """
         cfg = DEFAULT_CONFIG.copy()
         if self.proxy:
             cfg["proxy"] = self.proxy
@@ -113,8 +119,8 @@ class DockerBot:
             cfg,
             CATS,
             self.log.info,
-            mode="topics",
-            target_value=target_topics,
+            mode=mode,
+            target_value=target_value,
             enable_like=True,
             enable_reply=False,  # Docker 版默认不自动回帖（避免被检测）
             enable_wait=True,
@@ -124,16 +130,27 @@ class DockerBot:
             user_data_dir=self.user_data_dir,
         )
 
-    def run_once(self, target_topics=None):
-        """执行一次浏览任务"""
-        if target_topics is None:
-            target_topics = random.randint(*self.topics_range)
+    def run_once(self, target=None):
+        """执行一次浏览任务
+
+        target: 目标字符串（"30"=30帖，"30min"=30分钟，"1h"=1小时）；
+                None 时按 topics_range 随机生成帖子数（保持旧行为）。
+        """
+        if target is None:
+            mode, target_value = "topics", random.randint(*self.topics_range)
+        else:
+            mode, target_value = parse_target(target)
+
+        if mode == "topics":
+            desc = f"{target_value} 个帖子"
+        else:
+            desc = f"{target_value:g} 分钟"
 
         self.log.info("=" * 50)
-        self.log.info(f"开始浏览任务 | 目标: {target_topics} 个帖子")
+        self.log.info(f"开始浏览任务 | 目标: {desc}")
         self.log.info("=" * 50)
 
-        bot = self._make_bot(target_topics)
+        bot = self._make_bot(mode, target_value)
         self.current_bot = bot
         start = time.time()
 
@@ -155,12 +172,17 @@ class DockerBot:
 
 
 class RandomScheduler:
-    """每天随机生成 N 个运行时间点，模拟真人使用习惯"""
+    """每天随机生成 N 个运行时间点，模拟真人使用习惯
 
-    def __init__(self, bot, runs_per_day=2, topics_range=DEFAULT_TOPICS_RANGE):
+    target: 任务目标字符串（"30"=30帖，"30min"=30分钟，"1h"=1小时）；
+            None 时每次按 topics_range 随机生成帖子数（旧行为）。
+    """
+
+    def __init__(self, bot, runs_per_day=2, topics_range=DEFAULT_TOPICS_RANGE, target=None):
         self.bot = bot
         self.runs_per_day = runs_per_day
         self.topics_range = topics_range
+        self.target = target
         self.today_schedule = []
         self.running = True
         self._ran_today = False  # 今天是否已执行过任务（补跑判断用）
@@ -209,10 +231,11 @@ class RandomScheduler:
 
     def _run_task(self):
         """执行一次任务（异常隔离：单次失败不影响常驻调度）"""
-        topics = random.randint(*self.topics_range)
-        self.bot.log.info(f"定时任务触发 | 目标 {topics} 个帖子")
+        self.bot.log.info(
+            f"定时任务触发 | 目标 {self.target if self.target else '随机帖子数'}"
+        )
         try:
-            self.bot.run_once(target_topics=topics)
+            self.bot.run_once(target=self.target)
         except Exception as e:
             self.bot.log.err(f"任务异常（调度器继续运行）: {e}")
 
@@ -291,6 +314,7 @@ def parse_args(argv=None):
         epilog="""
 示例:
   python main.py docker -u myuser -p mypass
+  python main.py docker -u myuser -p mypass --target 1h
   python main.py docker -u myuser -p mypass --runs-per-day 2
   python main.py docker -u myuser -p mypass --once
 
@@ -298,11 +322,20 @@ def parse_args(argv=None):
   LINUXDO_USERNAME  用户名
   LINUXDO_PASSWORD  密码
   LINUXDO_PROXY     代理地址（可选）
+  LINUXDO_TARGET    任务目标（同 --target，默认随机 15-40 帖）
         """,
     )
 
     parser.add_argument("-u", "--username", help="用户名")
     parser.add_argument("-p", "--password", help="密码")
+    parser.add_argument(
+        "--target",
+        default=None,
+        help=(
+            "每次任务目标：带时间单位=按时间（30min/1h/45分钟），"
+            "纯数字=按帖子数（30/50帖）；默认随机 15-40 帖（或环境变量 LINUXDO_TARGET）"
+        ),
+    )
     parser.add_argument(
         "--like-rate", type=int, default=None, help="点赞概率 0-100（默认 30，或环境变量 LIKE_RATE）"
     )
@@ -372,6 +405,9 @@ def main(argv=None):
 
     topics_range = (max(1, topics_min), max(topics_min + 1, topics_max))
 
+    # 任务目标：命令行 > 环境变量 > None（每次随机帖子数）
+    target = _pick(args.target, "LINUXDO_TARGET", None)
+
     bot = DockerBot(
         username=username,
         password=password,
@@ -385,15 +421,17 @@ def main(argv=None):
     )
 
     logger.info(f"Linux.do 自动刷帖 Docker 版启动 (v{__version__}, CloakBrowser)")
+    if target:
+        logger.info(f"任务目标: {target}")
 
     if args.once:
-        topics = random.randint(*topics_range)
-        bot.run_once(target_topics=topics)
+        bot.run_once(target=target)
     else:
         scheduler = RandomScheduler(
             bot,
             runs_per_day=runs_per_day,
             topics_range=topics_range,
+            target=target,
         )
 
         def handle_signal(sig, frame):

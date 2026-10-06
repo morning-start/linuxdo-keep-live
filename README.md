@@ -50,8 +50,9 @@ uv run main.py
 # 命令行参数
 uv run main.py cli -u 用户名 -p 密码
 
-# 指定参数
-uv run main.py cli -u 用户名 -p 密码 --topics 50 --like-rate 20
+# 指定参数（--target：纯数字=帖子数，带单位=时长）
+uv run main.py cli -u 用户名 -p 密码 --target 50 --like-rate 20
+uv run main.py cli -u 用户名 -p 密码 --target 1h
 
 # 使用代理
 uv run main.py cli -u 用户名 -p 密码 --proxy 127.0.0.1:7897
@@ -60,17 +61,30 @@ uv run main.py cli -u 用户名 -p 密码 --proxy 127.0.0.1:7897
 export LINUXDO_USERNAME="用户名"
 export LINUXDO_PASSWORD="密码"
 export LINUXDO_PROXY="127.0.0.1:7897"
+export LINUXDO_TARGET="30min"
 uv run main.py cli
 ```
 
 无头版通过持久化 profile 保持登录态：首次输入账号密码登录，之后复用 Cookie，失效会自动重新登录。
+
+**运行目标 `--target`**（环境变量 `LINUXDO_TARGET`）：一个参数同时表达两种浏览方式——
+
+| 输入 | 含义 |
+| --- | --- |
+| `30` / `50帖` | 浏览 30 / 50 个帖子后停止 |
+| `30min` / `45分钟` | 运行 30 / 45 分钟后停止 |
+| `1h` / `1.5h` / `2小时` | 运行 1 / 1.5 / 2 小时后停止 |
+| `90s` | 运行 90 秒 |
+| 留空 / 识别不了 | 默认 **30 分钟** |
+
+规则：**带时间单位 = 按时长，纯数字 = 按帖子数量**。兼容旧参数名 `--topics`（等价 `--target`）。
 
 | 参数              | 默认值                      | 说明                                                |
 | ----------------- | --------------------------- | --------------------------------------------------- |
 | `-u, --username`  | 环境变量 `LINUXDO_USERNAME` | 用户名                                              |
 | `-p, --password`  | 环境变量 `LINUXDO_PASSWORD` | 密码                                                |
 | `--proxy`         | 环境变量 `LINUXDO_PROXY`    | 代理地址，如 `127.0.0.1:7897`（自动补全 `http://`） |
-| `--topics`        | 30                          | 目标浏览帖子数                                      |
+| `--target`        | 30min                       | 运行目标：纯数字=帖子数，带单位=时长（见上表）      |
 | `--like-rate`     | 30                          | 点赞概率（0-100）                                   |
 | `--browse-mode`   | deep                        | `deep`=深度爬楼，`quick`=快速浏览（3-5层换帖）      |
 | `--no-headless`   | 关闭                        | 显示浏览器窗口（调试/首次登录用）                   |
@@ -85,14 +99,17 @@ uv run main.py cli
 # 启动调度器：每天随机 2 个时间点（7:00-23:00 之间，±15 分钟抖动）各运行一次
 python main.py docker -u 用户名 -p 密码
 
-# 自定义频率与数量
+# 自定义频率与目标（--target 同 CLI：纯数字=帖子数，带单位=时长）
+python main.py docker -u 用户名 -p 密码 --runs-per-day 3 --target 45min
+
+# 每次随机 15-40 帖（不设 target 时的默认行为）
 python main.py docker -u 用户名 -p 密码 --runs-per-day 3 --topics-min 15 --topics-max 40
 
 # 只运行一次（调试用）
 python main.py docker -u 用户名 -p 密码 --once
 ```
 
-环境变量：`LINUXDO_USERNAME` / `LINUXDO_PASSWORD` / `LINUXDO_PROXY` / `LIKE_RATE` / `RUNS_PER_DAY` / `TOPICS_MIN` / `TOPICS_MAX` / `CHROME_USER_DATA` / `RUN_ON_START`（首次启动是否立即运行，默认 true）/ `DEBUG`。
+环境变量：`LINUXDO_USERNAME` / `LINUXDO_PASSWORD` / `LINUXDO_PROXY` / `LINUXDO_TARGET`（同 `--target`，未设置时每次随机 `TOPICS_MIN`-`TOPICS_MAX` 帖）/ `LIKE_RATE` / `RUNS_PER_DAY` / `TOPICS_MIN` / `TOPICS_MAX` / `CHROME_USER_DATA` / `RUN_ON_START`（首次启动是否立即运行，默认 true）/ `DEBUG`。
 
 每次任务浏览随机数量的帖子（默认 15-40），配合随机时间点，最大程度模拟真人使用习惯。
 
@@ -108,15 +125,18 @@ python main.py docker -u 用户名 -p 密码 --once
 #      LINUXDO_PROXY     代理地址（可选，留空 = 直连）
 #      CLOAKBROWSER_LICENSE_KEY  CloakBrowser key（可选，免费获取见上文）
 # 3. Actions 页启用 workflows，然后 Run Schedule -> Run workflow 手动触发；
-#    定时触发默认每天 UTC 1:00（北京时间 9:00），改 cron 在 yml 里调
+#    「运行目标」填纯数字 = 浏览 N 帖（如 30），带单位 = 时长（如 30min / 1h）；
+#    定时触发默认每天 UTC 1:00（北京时间 9:00），每次跑 30min，改 cron 在 yml 里调
 ```
 
 工作流细节：
 
 - CloakBrowser 内核（~200MB）自动下载并用 Actions Cache 缓存，第二次起不再下载
 - 依赖用 `uv sync --frozen`（uv.lock 锁定版本），CI 上走官方 PyPI 源
+- 手动触发参数：运行目标 `target`（同 CLI `--target` 规则）、点赞概率、浏览模式
 - 浏览 0 个帖子时 CLI 退出码为 1，该次运行标记失败（邮件通知可在 Watch -> Custom 里设置）
 - 同一时间只跑一个任务：上次未结束时新触发自动排队，不会并发登录同一账号
+- 注意 `timeout-minutes: 60`：`--target` 设为超过 1 小时的时长会被强制截断
 
 ### 代理怎么配（重要）
 
