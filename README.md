@@ -96,6 +96,28 @@ python main.py docker -u 用户名 -p 密码 --once
 
 每次任务浏览随机数量的帖子（默认 15-40），配合随机时间点，最大程度模拟真人使用习惯。
 
+### GitHub Actions 定时版（云端无头运行）
+
+仓库自带 [`.github/workflows/run-schedule.yml`](.github/workflows/run-schedule.yml)：在 GitHub 的服务器上定时/手动运行无头 CLI，本机无需开机。
+
+```bash
+# 1. Fork 本仓库并设为私有（Settings -> Danger Zone -> Make private）
+# 2. 添加 Secrets（Settings -> Secrets and variables -> Actions）：
+#      LINUXDO_USERNAME  用户名（必需）
+#      LINUXDO_PASSWORD  密码（必需）
+#      LINUXDO_PROXY     代理地址（可选，留空 = 直连）
+#      CLOAKBROWSER_LICENSE_KEY  CloakBrowser key（可选，免费获取见上文）
+# 3. Actions 页启用 workflows，然后 Run Schedule -> Run workflow 手动触发；
+#    定时触发默认每天 UTC 1:00（北京时间 9:00），改 cron 在 yml 里调
+```
+
+工作流细节：
+
+- CloakBrowser 内核（~200MB）自动下载并用 Actions Cache 缓存，第二次起不再下载
+- 依赖用 `uv sync --frozen`（uv.lock 锁定版本），CI 上走官方 PyPI 源
+- 浏览 0 个帖子时 CLI 退出码为 1，该次运行标记失败（邮件通知可在 Watch -> Custom 里设置）
+- 同一时间只跑一个任务：上次未结束时新触发自动排队，不会并发登录同一账号
+
 ### 代理怎么配（重要）
 
 **程序不强制使用代理，默认就是直连。** 代理只是可选项，填不填取决于你的网络环境：
@@ -164,6 +186,8 @@ python proxy_check.py 127.0.0.1:7897 # 测试指定代理端口
 ```
 linuxdo-keep-live/
 ├── main.py                     # 入口：GUI（默认）/ cli / docker 三个子命令
+├── .github/workflows/
+│   └── run-schedule.yml        # GitHub Actions 定时无头运行（CloakBrowser + uv）
 ├── proxy_check.py              # 代理连通性诊断工具
 ├── login_check.py              # 登录状态诊断工具
 ├── weaknet_test.py             # 弱网复现测试（限速验证列表等待逻辑）

@@ -1,0 +1,155 @@
+# ================================================================================
+# Linux.do 自动浏览定时任务（无头 CLI · CloakBrowser）
+# ================================================================================
+#
+# 功能：
+#   - 定时/手动在 GitHub Actions 上运行无头命令行版（python main.py cli）
+#   - CloakBrowser 隐身 Chromium 内核自动下载并缓存（约 200MB，首次后走缓存）
+#   - 自动登录（账号密码来自 Secrets）并浏览帖子
+#
+# ================================================================================
+# 使用说明
+# ================================================================================
+#
+# 1. Fork 本仓库到你的账号，并设为私有（保护你的账号信息）
+#    Settings -> General -> Danger Zone -> Change visibility -> Make private
+#
+# 2. 添加 Secrets（Settings -> Secrets and variables -> Actions -> New repository secret）
+#    - LINUXDO_USERNAME : 你的 Linux.do 用户名（必需）
+#    - LINUXDO_PASSWORD : 你的 Linux.do 密码（必需）
+#    - LINUXDO_PROXY    : 代理地址，如 http://127.0.0.1:7897（可选，留空 = 直连）
+#    - CLOAKBROWSER_LICENSE_KEY : CloakBrowser 许可 key（可选，用于获取最新内核；
+#      免费获取：https://cloakbrowser.dev/free 或 python -m cloakbrowser login）
+#
+# 3. 启用 Actions
+#    Actions -> I understand my workflows, go ahead and enable them
+#    （Fork 的仓库定时任务可能默认被禁用，需在 Actions 页手动启用）
+#
+# 4. 运行
+#    - 手动触发：Actions -> Run Schedule -> Run workflow（可填参数）
+#    - 定时触发：按下方 schedule cron 自动运行
+#
+# ================================================================================
+# 定时规则说明
+# ================================================================================
+#
+# cron 格式: 分 时 日 月 周
+#
+# 示例：
+#   '0 1 * * *'    - 每天 UTC 1:00（北京时间 9:00）
+#   '0 0,12 * * *' - 每天 UTC 0:00 和 12:00（北京时间 8:00 和 20:00）
+#   '0 1 * * 1-5'  - 工作日 UTC 1:00（北京时间 9:00）
+#
+# 注意：GitHub Actions 使用 UTC 时间，北京时间 = UTC + 8
+#       schedule 最短间隔 5 分钟，但高峰期可能延迟几分钟到几十分钟
+#
+# ================================================================================
+
+name: Run Schedule
+
+on:
+  # 定时触发（按需修改 cron；不需要定时就把下面两行注释掉）
+  schedule:
+    - cron: '0 1 * * *'   # 每天 UTC 1:00 = 北京时间 9:00
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      topics:
+        description: '浏览帖子数量'
+        required: false
+        default: '30'
+      like_rate:
+        description: '点赞概率 (0-100)'
+        required: false
+        default: '30'
+      browse_mode:
+        description: '浏览模式'
+        required: false
+        default: 'deep'
+        type: choice
+        options:
+          - deep   # 深度爬楼（完整阅读）
+          - quick  # 快速浏览（3-5 层换帖）
+
+# 同一时间只允许一个浏览任务（上一次没跑完时，新的定时触发自动跳过排队）
+concurrency:
+  group: run-schedule
+  cancel-in-progress: false
+
+jobs:
+  browse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # 最长运行 60 分钟
+
+    steps:
+      # 检出代码
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 设置 Python（项目要求 >= 3.12）
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 安装 uv（项目用 uv 管理依赖，pyproject.toml + uv.lock）
+      - name: Install uv
+        run: python -m pip install --upgrade uv
+
+      # 缓存 CloakBrowser 内核（~200MB），避免每次运行重新下载
+      # 如需强制更新内核：Actions -> 管理缓存 -> 删除该缓存后重跑
+      - name: Cache CloakBrowser binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cloakbrowser
+          key: cloakbrowser-${{ runner.os }}-x64
+
+      # 安装项目依赖（CI 上改用官方 PyPI 源，忽略项目里的清华镜像配置）
+      - name: Sync dependencies
+        run: uv sync --frozen --default-index https://pypi.org/simple
+
+      # 下载 CloakBrowser 隐身 Chromium 内核（已缓存则跳过下载）
+      - name: Install CloakBrowser binary
+        run: uv run python -m cloakbrowser install
+
+      # 安装 Chromium 运行所需的系统库（playwright 会通过 apt 安装）
+      - name: Install system dependencies
+        run: uv run playwright install-deps chromium
+
+      # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
+      - name: Run browse script
+        env:
+          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
+          LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
+          LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY }}
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          # 获取参数（手动触发时使用输入值，定时触发时使用默认值）
+          TOPICS="${{ github.event.inputs.topics || '30' }}"
+          LIKE_RATE="${{ github.event.inputs.like_rate || '30' }}"
+          BROWSE_MODE="${{ github.event.inputs.browse_mode || 'deep' }}"
+
+          echo "========================================"
+          echo "开始运行 Linux.do 自动浏览 (CloakBrowser)"
+          echo "目标帖子数: $TOPICS"
+          echo "点赞概率: $LIKE_RATE%"
+          echo "浏览模式: $BROWSE_MODE"
+          echo "========================================"
+
+          # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
+          uv run python main.py cli \
+            --topics "$TOPICS" \
+            --like-rate "$LIKE_RATE" \
+            --browse-mode "$BROWSE_MODE"
+
+      # 输出结果摘要（无论成败）
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 运行结果" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- 触发方式: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "- 北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
