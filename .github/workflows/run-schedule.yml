@@ -17,7 +17,8 @@
 # 2. 添加 Secrets（Settings -> Secrets and variables -> Actions -> New repository secret）
 #    - LINUXDO_USERNAME : 你的 Linux.do 用户名（必需）
 #    - LINUXDO_PASSWORD : 你的 Linux.do 密码（必需）
-#    - LINUXDO_PROXY    : 代理地址，如 http://127.0.0.1:7897（可选，留空 = 直连）
+#    - CLASH_SUB        : 你的 Clash/Clash Verge 订阅链接（推荐！见下方「走代理」说明）
+#    - LINUXDO_PROXY    : 代理地址，如 http://127.0.0.1:7897（不配 CLASH_SUB 时手工指定；留空 = 直连）
 #    - CLOAKBROWSER_LICENSE_KEY : CloakBrowser 许可 key（可选，用于获取最新内核；
 #      免费获取：https://cloakbrowser.dev/free 或 python -m cloakbrowser login）
 #
@@ -29,6 +30,22 @@
 #    - 手动触发：Actions -> Run Schedule -> Run workflow（可填参数）
 #      「运行目标」填纯数字 = 浏览 N 个帖子（30）；带单位 = 按时长（30min / 1h）
 #    - 定时触发：按下方 schedule cron 自动运行，默认 30min
+#
+# ================================================================================
+# 走代理说明（解决 GitHub 出口 IP 被 linux.do 限流 429 的问题）
+# ================================================================================
+#
+# GitHub Actions 的共享出口 IP 会被 linux.do 限流（HTTP 429 Too Many Requests），
+# 表现为登录表单永远等不到。解决办法：配置 CLASH_SUB Secret 填你的 Clash 订阅链接，
+# workflow 会：
+#   1. 下载 mihomo（Clash.Meta 内核）到 runner
+#   2. 用你的订阅拉取节点，启动本地代理（mixed-port 7897）
+#   3. 自检：通过代理访问 linux.do，若仍 429 则切换到下一个节点再试
+#   4. 浏览器流量走 http://127.0.0.1:7897，相当于把你电脑上的 Clash 搬进 CI
+#
+# 注意：
+#   - 订阅链接等同密码（含服务器地址和凭据），只放 Secrets，绝不写入日志
+#   - 不配 CLASH_SUB 且不配 LINUXDO_PROXY 时 = 直连，大概率被 429 拦截
 #
 # ================================================================================
 # 定时规则说明
@@ -118,8 +135,8 @@ jobs:
       - name: Install system dependencies
         run: uv run playwright install-deps chromium
 
-      # 安装 Linux 缺失字体（CloakBrowser 在 Linux 上伪装 Windows 指纹，
-      # 缺字体会导致 canvas 指纹异常、更容易被 Cloudflare 风控拦截）
+      # 安装字体（CloakBrowser 在 Linux 上伪装 Windows 指纹，
+      # 缺字体会导致 canvas 指纹异常、更容易被风控拦截）
       - name: Install fonts
         run: |
           sudo apt-get update -qq
@@ -127,12 +144,108 @@ jobs:
             fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
             fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
 
+      # ======================================================================
+      # 启动 mihomo（Clash 内核）：把订阅节点搬进 CI，绕开 GitHub 出口 IP 限流
+      # 配了 CLASH_SUB 才启用；跑完后浏览器走 http://127.0.0.1:7897
+      # ======================================================================
+      - name: Setup Clash proxy (mihomo)
+        if: ${{ secrets.CLASH_SUB != '' }}
+        env:
+          CLASH_SUB: ${{ secrets.CLASH_SUB }}
+        run: |
+          set -e
+          # ---- 下载 mihomo 内核（固定版本，保证可复现） ----
+          MIHOMO_VER="v1.19.32"
+          curl -sL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" -o mihomo.gz
+          gunzip -f mihomo.gz && chmod +x mihomo
+          ./mihomo -v
+
+          # ---- 生成最小配置：本地 mixed 端口 7897 + 订阅作为 provider ----
+          # 规则模式 + MATCH 全走 PROXY 组；不启用 TUN/系统代理，仅本地端口
+          # （用 printf 逐行写入，避免 heredoc 结束符与 YAML 块标量缩进冲突）
+          mkdir -p mihomo-work
+          {
+            echo 'mixed-port: 7897'
+            echo 'allow-lan: false'
+            echo 'mode: rule'
+            echo 'log-level: warning'
+            echo 'external-controller: 127.0.0.1:9090'
+            echo 'proxy-providers:'
+            echo '  sub:'
+            echo '    type: http'
+            echo '    url: "CLASH_SUB_PLACEHOLDER"'
+            echo '    path: sub.yaml'
+            echo '    interval: 86400'
+            echo '    health-check:'
+            echo '      enable: true'
+            echo '      url: https://www.gstatic.com/generate_204'
+            echo '      interval: 300'
+            echo 'proxy-groups:'
+            echo '  - name: PROXY'
+            echo '    type: select'
+            echo '    use:'
+            echo '      - sub'
+            echo 'rules:'
+            echo '  - MATCH,PROXY'
+          } > mihomo-work/config.yaml
+          # 订阅链接替换进配置（文件在 runner 本地，不打印内容）
+          # 用 perl 而非 sed：订阅 URL 常含 & 等字符，sed 替换串里 & 是特殊字符会写坏链接
+          CLASH_SUB="$CLASH_SUB" perl -pe 's/CLASH_SUB_PLACEHOLDER/$ENV{CLASH_SUB}/g' -i mihomo-work/config.yaml
+
+          # ---- 启动内核（后台常驻） ----
+          ./mihomo -d mihomo-work > mihomo-work/mihomo.log 2>&1 &
+          sleep 5
+
+          # ---- 等代理端口就绪 ----
+          PORT_OK=0
+          for i in $(seq 1 15); do
+            if curl -x http://127.0.0.1:7897 -s -o /dev/null --max-time 5 https://www.gstatic.com/generate_204; then
+              echo "mihomo 端口 7897 就绪"
+              PORT_OK=1
+              break
+            fi
+            echo "等待 mihomo 启动... ($i/15)"
+            sleep 2
+          done
+          if [ "$PORT_OK" != "1" ]; then
+            echo "::warning::mihomo 启动失败（订阅链接可能无效），浏览任务将直连"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # ---- 连通自检：逐个节点试到 linux.do 返回 200 为止 ----
+          # linux.do 对无 Cookie 的 curl 探测也可能回 403 challenge，
+          # 所以把 200 视为通过；403 也算「可达」（说明没被 429 限流，浏览器能过挑战）
+          PROBE_OK=0
+          for i in $(seq 0 9); do
+            CODE=$(curl -x http://127.0.0.1:7897 -s -o /dev/null -w '%{http_code}' \
+              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" \
+              --max-time 20 https://linux.do/ || echo 000)
+            echo "节点#$i 访问 linux.do -> HTTP $CODE"
+            if [ "$CODE" = "200" ] || [ "$CODE" = "403" ]; then PROBE_OK=1; break; fi
+            # 切换到 provider 列表里的下一个节点（9090 API 只在 runner 本地，安全）
+            NEXT=$(curl -s "http://127.0.0.1:9090/providers/proxies/sub" | jq -r ".all[$((i+1))] // empty" 2>/dev/null)
+            [ -z "$NEXT" ] && break
+            curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" -d "{\"name\":\"$NEXT\"}" > /dev/null
+            sleep 2
+          done
+
+          if [ "$PROBE_OK" = "1" ]; then
+            echo "PROXY_PASS=1" >> $GITHUB_ENV
+            echo "✅ 代理自检通过，浏览任务将走 Clash 节点"
+          else
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            echo "::warning::代理自检未通过（所有节点都无法打开 linux.do），浏览任务将直连重试"
+          fi
+
       # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
+      # 代理优先级：mihomo 自检通过 > LINUXDO_PROXY Secret > 直连
       - name: Run browse script
         env:
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY }}
+          CLASH_PROXY_PASS: ${{ env.PROXY_PASS }}
           CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
           CLOAKBROWSER_SUPPRESS_FONT_WARNING: '1'
           PYTHONUNBUFFERED: '1'
@@ -142,6 +255,19 @@ jobs:
           LIKE_RATE="${{ github.event.inputs.like_rate || '30' }}"
           BROWSE_MODE="${{ github.event.inputs.browse_mode || 'deep' }}"
 
+          # 代理决策：mihomo 自检通过则强制走本地 7897；
+          # 未通过但配置了 LINUXDO_PROXY 则用用户的代理；否则直连
+          if [ "${CLASH_PROXY_PASS}" = "1" ]; then
+            PROXY="http://127.0.0.1:7897"
+            echo "走代理: mihomo (127.0.0.1:7897, 自检通过)"
+          elif [ -n "${LINUXDO_PROXY}" ]; then
+            PROXY="${LINUXDO_PROXY}"
+            echo "走代理: LINUXDO_PROXY ($PROXY)"
+          else
+            PROXY=""
+            echo "直连（未配置 CLASH_SUB / LINUXDO_PROXY，可能被 linux.do 限流）"
+          fi
+
           echo "========================================"
           echo "开始运行 Linux.do 自动浏览 (CloakBrowser)"
           echo "运行目标: $TARGET（纯数字=帖子数，带单位=时长）"
@@ -150,10 +276,18 @@ jobs:
           echo "========================================"
 
           # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
-          uv run python main.py cli \
-            --target "$TARGET" \
-            --like-rate "$LIKE_RATE" \
-            --browse-mode "$BROWSE_MODE"
+          if [ -n "$PROXY" ]; then
+            uv run python main.py cli \
+              --target "$TARGET" \
+              --like-rate "$LIKE_RATE" \
+              --browse-mode "$BROWSE_MODE" \
+              --proxy "$PROXY"
+          else
+            uv run python main.py cli \
+              --target "$TARGET" \
+              --like-rate "$LIKE_RATE" \
+              --browse-mode "$BROWSE_MODE"
+          fi
 
       # 输出结果摘要（无论成败）
       - name: Summary

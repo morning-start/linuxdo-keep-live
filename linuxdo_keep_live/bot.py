@@ -300,6 +300,10 @@ def normalize_proxy(proxy):
     proxy = str(proxy).strip()
     if not proxy:
         return None
+    if "," in proxy:
+        # 多个候选代理（逗号分隔，如 mihomo 输出的 http://127.0.0.1:7897,http://127.0.0.1:7890）
+        # 取第一个即可——mihomo 的 mixed-port 同时收 HTTP/SOCKS，一个就够
+        proxy = proxy.split(",")[0].strip()
     if "://" in proxy:
         return proxy
     return "http://" + proxy
