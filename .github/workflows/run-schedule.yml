@@ -118,6 +118,15 @@ jobs:
       - name: Install system dependencies
         run: uv run playwright install-deps chromium
 
+      # 安装 Linux 缺失字体（CloakBrowser 在 Linux 上伪装 Windows 指纹，
+      # 缺字体会导致 canvas 指纹异常、更容易被 Cloudflare 风控拦截）
+      - name: Install fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+            fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+
       # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
       - name: Run browse script
         env:
@@ -125,6 +134,7 @@ jobs:
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY }}
           CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
+          CLOAKBROWSER_SUPPRESS_FONT_WARNING: '1'
           PYTHONUNBUFFERED: '1'
         run: |
           # 获取参数（手动触发时使用输入值，定时触发时使用默认值）
@@ -154,3 +164,13 @@ jobs:
           echo "- 触发方式: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
           echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
           echo "- 北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
+
+      # 失败时导出登录失败截图 / 页面快照（用于排查风控拦截；不含账号密码）
+      - name: Upload debug artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: login-debug
+          path: browser_data/debug/
+          if-no-files-found: ignore
+          retention-days: 7

@@ -19,6 +19,7 @@
 import os
 import random
 import time
+from datetime import datetime
 
 from cloakbrowser import launch_persistent_context
 
@@ -820,45 +821,145 @@ class Bot:
             return False
 
     def login(self, username, password):
-        """使用账号密码自动登录（无头版 / Docker 用）"""
+        """使用账号密码自动登录（无头版 / Docker 用）
+
+        强化点（GitHub Actions 首跑失败复盘）：
+            - 登录入口先试首页「登录」按钮（Discourse SPA 弹出登录模态框），
+              失败再退回 /login 独立页 —— 有些环境直接开 /login 会被重定向
+            - 表单等待用 wait_for_selector 显式等待（默认 20s，弱网/风控页慢），
+              而不是 fill() 的默认超时；等待期间输出页面现场便于定位
+            - 等不到表单时自动重试整段流程（Cloudflare 挑战通常几秒后放行）
+        """
         self.lg("开始登录...")
 
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if attempt > 1:
+                    self.lg(f"登录重试（第 {attempt}/{max_attempts} 次）...")
+                    self._wait_seconds(3)
+
+                # ---- 进入登录界面 ----
+                if self._open_login_ui():
+                    # ---- 等待登录表单出现 ----
+                    if not self._wait_login_form():
+                        self.lg("登录表单未出现（可能被风控页拦截），重试...")
+                        self._save_login_debug(f"login-no-form-attempt{attempt}")
+                        continue
+
+                    # ---- 填表并提交 ----
+                    self.lg("输入用户名...")
+                    self.pg.locator("#login-account-name").fill(username)
+                    self._random_delay(0.5, 1, "输入用户名后")
+
+                    self.lg("输入密码...")
+                    self.pg.locator("#login-account-password").fill(password)
+                    self._random_delay(0.5, 1, "输入密码后")
+
+                    self.lg("点击登录按钮...")
+                    self.pg.locator("#login-button").click()
+
+                    # 等待登录完成
+                    self._random_delay(3, 5, "等待登录")
+
+                    # 验证登录状态
+                    if self._check_login():
+                        self.lg("登录成功")
+                        return True
+                    self.lg("登录表单提交后未检测到登录态，请检查用户名和密码")
+                    self._log_login_diag()
+                    self._save_login_debug("login-submit-failed")
+                    # 提交成功但验证失败：多半是密码错误，重试意义不大
+                    return False
+                else:
+                    self.lg("无法进入登录界面，重试...")
+                    self._save_login_debug(f"login-no-entry-attempt{attempt}")
+            except Exception as e:
+                self.lg(f"登录过程出错: {e}")
+
+        return False
+
+    def _save_login_debug(self, name):
+        """登录失败时保存页面截图与 HTML 快照到 browser_data/debug/（尽力而为）
+
+        GitHub Actions 上失败时配合 upload-artifact 下载排查；本地调试也适用。
+        文件不含账号密码，但截图可能包含页面内容，勿外传。
+        """
         try:
-            # 访问登录页面
-            login_url = f"{self.cfg['base']}/login"
-            if not self._goto_with_hint(login_url, "登录页"):
-                return False
-            self._random_delay(2, 4, "页面加载")
-
-            # 输入用户名
-            self.lg("输入用户名...")
-            self.pg.locator("#login-account-name").fill(username)
-            self._random_delay(0.5, 1, "输入用户名后")
-
-            # 输入密码
-            self.lg("输入密码...")
-            self.pg.locator("#login-account-password").fill(password)
-            self._random_delay(0.5, 1, "输入密码后")
-
-            # 点击登录按钮
-            self.lg("点击登录按钮...")
-            self.pg.locator("#login-button").click()
-
-            # 等待登录完成
-            self._random_delay(3, 5, "等待登录")
-
-            # 验证登录状态
-            if self._check_login():
-                self.lg("登录成功")
-                return True
-            else:
-                self.lg("登录失败，请检查用户名和密码")
-                self._log_login_diag()
-                return False
-
+            debug_dir = os.path.join(self.user_data_dir, "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            shot = os.path.join(debug_dir, f"{name}-{ts}.png")
+            self.pg.screenshot(path=shot, full_page=False)
+            self.lg(f"已保存登录失败截图: {shot}")
+            html = os.path.join(debug_dir, f"{name}-{ts}.html")
+            with open(html, "w", encoding="utf-8") as f:
+                f.write(self.pg.content())
+            self.lg(f"已保存页面快照: {html}")
         except Exception as e:
-            self.lg(f"登录过程出错: {e}")
-            return False
+            self.lg(f"保存登录调试信息失败: {e}")
+
+    def _open_login_ui(self):
+        """进入登录界面：优先首页「登录」按钮（SPA 模态框），退回 /login 独立页"""
+        # 方式一：首页点击「登录」按钮（Discourse 标准路径，弹出登录模态框）
+        if self._goto_with_hint(self.cfg["base"], "首页"):
+            self._random_delay(1, 2, "首页加载")
+            try:
+                btn = self.pg.locator(".login-button, button.login-button").first
+                btn.wait_for(state="visible", timeout=8000)
+                btn.click()
+                self.lg("已点击首页登录按钮")
+                self._random_delay(1, 2, "等待登录框弹出")
+                return True
+            except Exception:
+                self.lg("首页登录按钮不可用，尝试直接打开登录页...")
+
+        # 方式二：直接访问 /login 独立页
+        login_url = f"{self.cfg['base']}/login"
+        return self._goto_with_hint(login_url, "登录页")
+
+    def _wait_login_form(self, timeout_ms=20000):
+        """等待登录表单渲染完成，期间输出页面现场（首次超时一半时输出一次）"""
+        reported = False
+        try:
+            self.pg.wait_for_selector(
+                "#login-account-name", timeout=timeout_ms, state="attached"
+            )
+            self.pg.wait_for_selector(
+                "#login-account-password", timeout=5000, state="attached"
+            )
+            return True
+        except Exception:
+            pass
+
+        # 用户名框等到了但密码框没有：输出现场，再补等一轮
+        if self._has("#login-account-name", timeout_ms=1000):
+            self._log_login_diag()
+            try:
+                self.pg.wait_for_selector(
+                    "#login-account-password", timeout=10000, state="attached"
+                )
+                return True
+            except Exception:
+                return False
+
+        # 完全没等到：等待过半时输出一次现场，帮助判断是否为 Cloudflare 拦截
+        remaining = timeout_ms / 1000 / 2
+        while remaining > 0 and not reported:
+            self._wait_seconds(min(1.0, remaining))
+            remaining -= 1.0
+            if self._has("#login-account-name", timeout_ms=500):
+                try:
+                    self.pg.wait_for_selector(
+                        "#login-account-password", timeout=5000, state="attached"
+                    )
+                    return True
+                except Exception:
+                    return False
+            if remaining <= timeout_ms / 1000 / 4:
+                self._log_login_diag()
+                reported = True
+        return False
 
     # ---------------- 等级信息 ----------------
 
@@ -1497,6 +1598,10 @@ class Bot:
                 if not self._check_login():
                     if not self.login(username, password):
                         self.lg("登录失败，任务终止")
+                        self.lg(
+                            "常见原因：账号密码错误、Cloudflare 风控页拦截（服务器 IP 信誉差，"
+                            "可配置 LINUXDO_PROXY 走代理）、或登录页改版"
+                        )
                         return
                 else:
                     self.lg("已存在有效登录状态（持久化 profile）")
