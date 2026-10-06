@@ -11,3 +11,6 @@ wheels/
 
 # 浏览器用户数据目录（含登录态，不要提交）
 browser_data/
+
+# 订阅内容临时文件（含节点凭据，不要提交）
+sub_secret_content.txt
