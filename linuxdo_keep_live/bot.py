@@ -802,7 +802,8 @@ class Bot:
                 f"页面状态: 标题={diag.get('title', '?')!r} | "
                 f"#current-user={diag.get('hasCurrentUser')} | "
                 f"登录链接={diag.get('hasLoginLink')} | "
-                f"Cloudflare挑战={diag.get('cf')}"
+                f"Cloudflare挑战={diag.get('cf')} | "
+                f"正文开头={str(diag.get('bodyStart', ''))[:40]!r}"
             )
             if diag.get("cf"):
                 self.lg("⚠ 检测到 Cloudflare 人机验证页面：请在弹出的浏览器中完成验证后再登录")
@@ -843,8 +844,17 @@ class Bot:
                 if self._open_login_ui():
                     # ---- 等待登录表单出现 ----
                     if not self._wait_login_form():
-                        self.lg("登录表单未出现（可能被风控页拦截），重试...")
+                        reason = self._rate_limited_or_challenge()
                         self._save_login_debug(f"login-no-form-attempt{attempt}")
+                        if reason == "rate_limited":
+                            # 429 限流：短间隔重试毫无意义，等 60s 让限流窗口过去
+                            if attempt < max_attempts:
+                                self.lg("检测到限流页（HTTP 429），等待 60s 后重试...")
+                                self._wait_seconds(60)
+                                continue
+                            self.lg("多次重试仍被限流，任务终止")
+                            return False
+                        self.lg("登录表单未出现（可能被风控页拦截），重试...")
                         continue
 
                     # ---- 填表并提交 ----
@@ -878,6 +888,25 @@ class Bot:
                 self.lg(f"登录过程出错: {e}")
 
         return False
+
+    def _rate_limited_or_challenge(self):
+        """判断当前页面是限流页（HTTP 429）还是其他风控拦截
+
+        Returns:
+            "rate_limited"  站点限流页（正文就是 "Too Many Requests"）
+            "challenge"     Cloudflare 等挑战页
+            "other"         其他情况
+        """
+        try:
+            body = (self.pg.evaluate("() => document.body ? document.body.innerText : ''") or "").strip()
+        except Exception:
+            return "other"
+        if "too many requests" in body.lower():
+            return "rate_limited"
+        diag = self._page_diag()
+        if diag.get("cf"):
+            return "challenge"
+        return "other"
 
     def _save_login_debug(self, name):
         """登录失败时保存页面截图与 HTML 快照到 browser_data/debug/（尽力而为）

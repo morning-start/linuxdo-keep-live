@@ -139,11 +139,11 @@ python main.py docker -u 用户名 -p 密码 --once
 - 注意 `timeout-minutes: 60`：`--target` 设为超过 1 小时的时长会被强制截断
 - 登录失败自动重试 3 次，并在 `browser_data/debug/` 留下截图 + 页面快照（失败时作为 artifact 上传，可下载排查）
 
-**风控提示**：GitHub Actions 的 IP 段属于数据中心，Cloudflare 对其信誉评分低，首次登录（profile 为空、无 Cookie 历史时）容易被挑战页拦截。表现是日志里反复出现「登录表单未出现」，页面现场显示 Cloudflare 挑战。建议：
+**风控提示**：GitHub Actions 的 IP 是数据中心共享段，linux.do 对其限流严重——首次登录常见失败是站点直接返回 HTTP 429（日志里「正文开头='Too Many Requests'」或截图白底一行字即是）。程序会识别限流页并等 60s 长退避后重试；若三次重试仍被限流，只能：
 
-1. **配置 `LINUXDO_PROXY` Secret** 走住宅代理（IP 信誉好，最有效）
-2. 利用 Actions Cache 的持久 profile 累积 Cookie：首次运行若被拦截，重跑几次直到某次通过，之后登录态会缓存在 `~/.cloakbrowser` 同级的 `browser_data`（注意：默认 workflow 不缓存 `browser_data`，可自行加一条 actions/cache）
-3. 若始终无法通过，改为本地/Docker 运行（家宽 IP 信誉好得多）
+1. **配置 `LINUXDO_PROXY` Secret** 走住宅/家宽代理（IP 信誉好，最有效）
+2. 错峰：把 cron 换到 GitHub 出口 IP 压力小的时段再试
+3. 改为本地/Docker 运行（家宽 IP 信誉好得多）
 
 ### 代理怎么配（重要）
 
