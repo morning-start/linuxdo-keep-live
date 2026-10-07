@@ -172,7 +172,7 @@ def ensure_mihomo(workdir: str) -> str:
         if name in files:
             return os.path.join(root, name)
 
-    key = (sys.platform, os.uname.machine if sys.platform != "win32" else "amd64")
+    key = (sys.platform, os.uname().machine if sys.platform != "win32" else "amd64")
     asset = ASSETS.get(key)
     if not asset:
         raise SystemExit(f"不支持的平台: {key}")
