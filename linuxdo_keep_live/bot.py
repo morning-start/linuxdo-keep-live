@@ -524,7 +524,21 @@ class Bot:
                 proxy = normalize_proxy(self.cfg.get("proxy"))
                 if proxy:
                     kwargs["proxy"] = proxy
-                    self.lg(f"已设置代理: {proxy}")
+                    # WebRTC 的 ICE candidate 会带上本机真实公网 IP。走代理时它与
+                    # HTTP 出口 IP 不一致，等于直接向 Cloudflare 自证"我在用代理"，
+                    # 现象就是挑战页一直停在 Verifying… 且换任何节点都过不了。
+                    # 这里把 WebRTC 伪装成代理的出口 IP：自己先探（探到就写死，
+                    # 日志与伪装值必然一致），探不到再交给 CloakBrowser 的 auto 解析。
+                    egress = self._egress_ip(proxy)
+                    if egress:
+                        webrtc_arg = f"--fingerprint-webrtc-ip={egress}"
+                    else:
+                        webrtc_arg = "--fingerprint-webrtc-ip=auto"
+                    kwargs["args"] = [webrtc_arg]
+                    self.lg(
+                        f"已设置代理: {proxy}（出口 IP {egress or '待解析'}，"
+                        "WebRTC 已伪装为同一出口）"
+                    )
 
                 os.makedirs(self.user_data_dir, exist_ok=True)
                 self.lg(f"用户数据目录: {self.user_data_dir}")
@@ -532,10 +546,13 @@ class Bot:
                 # CloakBrowser：返回标准 Playwright BrowserContext
                 self.ctx = launch_persistent_context(self.user_data_dir, **kwargs)
 
-                # 禁用图片加载：弱网下显著降低流量与首屏时间（帖子文本/计数不受影响）
+                # 图片屏蔽【不在这里启用】：ctx.route("**/*") 会把包括
+                # challenges.cloudflare.com 在内的每个请求都过一遍 Playwright，
+                # 改写请求头并串行化网络，足以打断 Cloudflare 的托管挑战
+                # ——现象就是挑战页一直停在 Verifying… 永不完成。
+                # 改为登录成功后再启用（见 _enable_image_block），省流量的收益本来也在浏览阶段。
                 if self.block_images:
-                    self.ctx.route("**/*", self._on_route)
-                    self.lg("已禁用图片加载（提速）")
+                    self.lg("图片屏蔽待登录成功后启用（避免干扰 Cloudflare 挑战）")
 
                 self.pg = self.ctx.new_page()
                 self.lg("浏览器就绪")
@@ -563,6 +580,20 @@ class Bot:
         self.run = False
 
     # ---------------- 请求拦截 ----------------
+
+    def _enable_image_block(self):
+        """登录成功后再挂图片屏蔽路由。
+
+        必须晚于登录：请求拦截会干扰 Cloudflare 托管挑战（见 start() 注释）。
+        已登录时再启用，浏览阶段照样省流量。
+        """
+        if not self.block_images or not self.ctx:
+            return
+        try:
+            self.ctx.route("**/*", self._on_route)
+            self.lg("已禁用图片加载（提速）")
+        except Exception as e:
+            self.lg(f"启用图片屏蔽失败（忽略，不影响浏览）: {e}")
 
     def _on_route(self, route):
         """请求路由：拦截图片请求以节省流量、降低首屏时间。
@@ -670,7 +701,7 @@ class Bot:
                     title: document.title,
                     hasCurrentUser: !!document.querySelector('#current-user'),
                     hasLoginLink: Array.from(document.querySelectorAll('a')).some(a => (a.getAttribute('href')||'').includes('/login')),
-                    cf: !!document.querySelector('#challenge-form, #cf-chl-widget, .cf-browser-verification, script[src*="challenges.cloudflare.com"]'),
+                    cf: !!document.querySelector('#challenge-form, #cf-chl-widget, .cf-browser-verification, .cf-turnstile, #challenge-running, #challenge-stage, .challenge-platform, iframe[src*="challenges.cloudflare.com"], script[src*="challenges.cloudflare.com"]'),
                     bodyStart: document.body ? document.body.innerText.slice(0, 80) : ''
                 })"""
             )
@@ -851,7 +882,8 @@ class Bot:
                     self.lg(f"登录重试（第 {attempt}/{max_attempts} 次）...")
                     self._wait_seconds(3)
                     # 换一个 Clash 出口节点再试（当前节点 IP 可能被 CF 硬拦）
-                    self._rotate_clash_node()
+                    if self._rotate_clash_node():
+                        self._restart_browser_on_new_egress()
 
                 # ---- 进入登录界面 ----
                 if self._open_login_ui():
@@ -909,6 +941,60 @@ class Bot:
 
         return False
 
+    def _egress_ip(self, proxy=None, timeout=8):
+        """取当前出口公网 IP（配置了代理时就是代理节点的真实出口 IP）。
+
+        用于诊断：Cloudflare 打分主要看这个 IP 的信誉，日志里留下它才能
+        判断"换节点"到底换了个什么东西，以及同一节点的出口 IP 会不会漂。
+        """
+        url = proxy or normalize_proxy(self.cfg.get("proxy"))
+        if url:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": url, "https": url})
+            )
+        else:
+            opener = urllib.request.build_opener()
+        for svc in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+            try:
+                with opener.open(svc, timeout=timeout) as resp:
+                    ip = resp.read().decode("utf-8", "ignore").strip()
+                if ip and " " not in ip and len(ip) < 48:
+                    return ip
+            except Exception:
+                continue
+        return None
+
+    def _log_egress_ip(self, proxy=None):
+        """打印当前出口 IP（尽力而为，失败不影响主流程）。"""
+        ip = self._egress_ip(proxy)
+        self.lg(f"当前出口 IP: {ip or '获取失败'}")
+        return ip
+
+    def _restart_browser_on_new_egress(self):
+        """换出口节点（IP 变了）之后重建浏览器。
+
+        两件必须做的事：
+        1. WebRTC 伪装值是按启动当时的出口 IP 写死的。换了节点不重建，就会变成
+           HTTP 走新 IP、WebRTC 仍声称旧 IP —— 比不伪装更像在用代理。
+        2. cf_clearance 与签发它的 IP 强绑定，留着旧 IP 的 cookie 去请求新 IP，
+           Cloudflare 会直接判无效并重新发起挑战。
+        """
+        if not normalize_proxy(self.cfg.get("proxy")):
+            return False
+        try:
+            self.lg("出口 IP 已变，重建浏览器（同步 WebRTC 伪装 + 清掉旧 IP 的 cf_clearance）...")
+            if not self.start():
+                self.lg("重建浏览器失败")
+                return False
+            try:
+                self.ctx.clear_cookies()
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            self.lg(f"重建浏览器出错: {e}")
+            return False
+
     def _rotate_clash_node(self):
         """经 mihomo 控制 API 切换到下一个出口节点。
 
@@ -941,6 +1027,7 @@ class Bot:
             urllib.request.urlopen(req, timeout=5).read()
             self.lg(f"切换 Clash 出口节点 -> {name}")
             self._wait_seconds(1)
+            self._log_egress_ip()
             return name
         except Exception as e:
             self.lg(f"切换 Clash 节点失败: {e}")
@@ -949,32 +1036,62 @@ class Bot:
     def _wait_cf_clear(self, timeout_s=60):
         """Cloudflare 挑战页出现时，等待 CloakBrowser 自动通过。
 
-        关键原则：挑战解析期间【绝不刷新页面】——刷新会重置 CF 的托管挑战进度，
-        导致永远过不了。这里只静默轮询标题/特征，给内核足够时间自行完成验证。
+        两条铁律：
+        1. 挑战解析期间【绝不刷新页面】——刷新会重置 CF 的托管挑战进度，
+           导致永远过不了。这里只静默轮询，给内核足够时间自行完成验证。
+        2. 判"已通过"必须有【正向证据】并且连续两次稳定。只看"没发现挑战特征"
+           会误报：Turnstile 内部跳转的一瞬间 title 为空、evaluate 直接抛异常，
+           此时读到的是一片空白，却会被当成"挑战消失"（曾导致日志先说已通过、
+           29 秒后又变回 Just a moment，掩盖了真实卡点）。
 
         Returns:
             True  挑战已通过（或本就没有挑战）
             False 超时仍卡在挑战页
         """
         deadline = time.time() + timeout_s
-        seen = False
+        seen = False  # 是否确实见过挑战页
+        clear_streak = 0  # 连续确认"已是真实页面"的次数
         while self.run and time.time() < deadline:
             diag = self._page_diag()
+            if not diag:
+                # 页面正在跳转/重绘，信息不足：既不判通过也不判失败，继续等
+                clear_streak = 0
+                time.sleep(2)
+                continue
             title = (diag.get("title") or "").lower()
+            body = (diag.get("bodyStart") or "").strip()
+            real_content = bool(
+                body or diag.get("hasCurrentUser") or diag.get("hasLoginLink")
+            )
             challenging = (
                 bool(diag.get("cf"))
                 or "just a moment" in title
                 or "checking your browser" in title
+                or not title  # 空标题基本只出现在挑战页跳转中
             )
-            if not challenging:
+            if challenging:
+                clear_streak = 0
+                if not seen:
+                    self.lg(
+                        f"检测到 Cloudflare 挑战页，等待自动通过（不刷新，最长 {timeout_s}s）..."
+                    )
+                    seen = True
+                time.sleep(2)
+                continue
+            # 非挑战态：还得看到真实页面内容，且连续两次稳定，才算真过了
+            if not real_content:
+                clear_streak = 0
+                time.sleep(2)
+                continue
+            clear_streak += 1
+            if clear_streak >= 2 or not seen:
                 if seen:
                     self.lg("Cloudflare 挑战已通过")
                 return True
-            if not seen:
-                self.lg(f"检测到 Cloudflare 挑战页，等待自动通过（不刷新，最长 {timeout_s}s）...")
-                seen = True
             time.sleep(2)
-        return not self._page_diag().get("cf")
+        if seen:
+            self.lg(f"等待 {timeout_s}s 仍未通过 Cloudflare 挑战")
+        return False
 
     def _rate_limited_or_challenge(self):
         """判断当前页面是限流页（HTTP 429）还是其他风控拦截
@@ -1728,6 +1845,9 @@ class Bot:
                     self.lg("登录检查失败或超时，任务终止")
                     return
                 login_success = True
+
+            # 登录已达成，此时才可以安全启用请求拦截（图片屏蔽）
+            self._enable_image_block()
 
             # 获取等级信息
             self.get_level_info()
