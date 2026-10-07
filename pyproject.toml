@@ -4,7 +4,7 @@ version = "1.0.0"
 description = "Linux.do 论坛自动浏览助手（基于 CloakBrowser 隐身浏览器）"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["cloakbrowser>=0.5.11"]
+dependencies = ["cloakbrowser>=0.5.12"]
 
 [project.optional-dependencies]
 # GUI 系统托盘支持（缺失时自动降级，不影响主功能）

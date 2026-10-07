@@ -111,16 +111,16 @@ wheels = [
 
 [[package]]
 name = "cloakbrowser"
-version = "0.5.11"
+version = "0.5.12"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx" },
     { name = "playwright" },
 ]
-sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/bc/d1/657a2cf554241dbc2e2c2e099106462c982dca0fd49464a6b3baa7449751/cloakbrowser-0.5.11.tar.gz", hash = "sha256:198cb298b4992ec6438ee28b51c481c8371edc87ca85852849d76505bd4dbbdb", size = 5759638, upload-time = "2026-09-24T22:06:53.554Z" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/75/ed/ca7144a592654e3252df77b99e7ab55fbe3b1501d03059fd904a3cd2c8c9/cloakbrowser-0.5.12.tar.gz", hash = "sha256:56dde14ae5900462759190fb307b4c15c670e7442a87bfa1246b06cd43ad6383", size = 5763164, upload-time = "2026-10-04T18:22:14.257Z" }
 wheels = [
-    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/b3/d5/325526cab1f240c8f2ed02d2de58bab836965a0522b89ad0d5dbb62e66f2/cloakbrowser-0.5.11-py3-none-any.whl", hash = "sha256:0f49392ca317c2393e99526131ad629d33bebb5fbf02be31cb4a49d596eeb752", size = 135959, upload-time = "2026-09-24T22:06:51.973Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/e9/5e/992f025861907a73d765a57dc0ea92303258aa788ebb30818d3c21ae7e02/cloakbrowser-0.5.12-py3-none-any.whl", hash = "sha256:4614baedcca123816b497df017755a176b8bffc7115f8fade164a774bdf29cbb", size = 137173, upload-time = "2026-10-04T18:22:12.48Z" },
 ]
 
 [[package]]
@@ -315,7 +315,7 @@ gui = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cloakbrowser", specifier = ">=0.5.11" },
+    { name = "cloakbrowser", specifier = ">=0.5.12" },
     { name = "pillow", marker = "extra == 'gui'", specifier = ">=10.0.0" },
     { name = "pystray", marker = "extra == 'gui'", specifier = ">=0.19.0" },
 ]
