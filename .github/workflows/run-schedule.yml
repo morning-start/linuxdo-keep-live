@@ -124,12 +124,13 @@ jobs:
         run: python -m pip install --upgrade uv
 
       # 缓存 CloakBrowser 内核（~200MB），避免每次运行重新下载
-      # 如需强制更新内核：Actions -> 管理缓存 -> 删除该缓存后重跑
+      # 注意：缓存只在整个 job 成功时才保存——之前反复下载就是因为任务中途失败
+      # key 绑定 cloakbrowser 包版本，升级包后自动换新缓存（可手动改后缀强制刷新）
       - name: Cache CloakBrowser binary
         uses: actions/cache@v4
         with:
           path: ~/.cloakbrowser
-          key: cloakbrowser-${{ runner.os }}-x64
+          key: cloakbrowser-${{ runner.os }}-x64-v2
 
       # 安装项目依赖（CI 上改用官方 PyPI 源，忽略项目里的清华镜像配置）
       - name: Sync dependencies
@@ -303,14 +304,29 @@ jobs:
           fi
 
           # ---- 过滤真实节点：跳过「剩余流量/官网/到期/重置」等占位节点 ----
-          ALL_NODES=$(curl -s http://127.0.0.1:9090/providers/proxies/sub | jq -r '.all[]')
-          REAL_NODES=$(echo "$ALL_NODES" | grep -viE '剩余|流量|官网|到期|重置|expire|traffic|套餐|防失联')
+          # provider 名不一定是 "sub"（file 类型可能注册为 default），先动态发现
+          PROVIDER=$(curl -s http://127.0.0.1:9090/providers/proxies \
+            | jq -r '.providers | to_entries[] | select(.key != "compatible") | .key' | head -1)
+          [ -z "$PROVIDER" ] && PROVIDER="sub"
+          echo "使用 provider: $PROVIDER"
+          ALL_NODES=$(curl -s "http://127.0.0.1:9090/providers/proxies/$PROVIDER" | jq -r '.all[]? // empty')
+          if [ -z "$ALL_NODES" ]; then
+            # 兜底：不区分 provider，从 PROXY 组里拿节点列表
+            echo "provider 接口未取到节点，改从 PROXY 组读取..."
+            ALL_NODES=$(curl -s http://127.0.0.1:9090/proxies/PROXY | jq -r '.all[]? // empty')
+          fi
+          if [ -z "$ALL_NODES" ]; then
+            echo "::warning::9090 API 取不到节点列表，跳过过滤直接用默认节点"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+          REAL_NODES=$(echo "$ALL_NODES" | grep -viE '剩余|流量|官网|到期|重置|expire|traffic|套餐|防失联' || true)
           REAL_COUNT=$(echo "$REAL_NODES" | grep -c . || true)
           echo "订阅节点总数 $(echo "$ALL_NODES" | grep -c .)，真实节点候选 $REAL_COUNT"
           if [ "$REAL_COUNT" = "0" ]; then
-            echo "::warning::订阅里没有真实节点（全是占位信息节点？），检查订阅内容"
-            echo "PROXY_PASS=0" >> $GITHUB_ENV
-            exit 0
+            echo "::warning::过滤后没有真实节点，退回全量节点"
+            REAL_NODES="$ALL_NODES"
+            REAL_COUNT=$(echo "$ALL_NODES" | grep -c . || true)
           fi
 
           # ---- 连通自检：逐个真实节点试到 linux.do 返回 200/403 为止 ----
@@ -322,8 +338,9 @@ jobs:
             [ -z "$NODE" ] && continue
             if [ "$IDX" -ge 10 ]; then echo "已试完 10 个节点"; break; fi
             # 切换 PROXY 组到该节点（9090 API 只在 runner 本地，安全）
-            curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" \
-              -d "$(jq -n --arg n "$NODE" '{name:$n}')" > /dev/null
+            BODY=$(jq -n --arg n "$NODE" '{name:$n}') \
+              && curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" -d "$BODY" > /dev/null \
+              || { echo "切换节点失败，跳过"; IDX=$((IDX+1)); continue; }
             sleep 1
             CODE=$(curl -x http://127.0.0.1:7897 -s -o /dev/null -w '%{http_code}' \
               -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" \
