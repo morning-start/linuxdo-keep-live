@@ -178,6 +178,7 @@ def ensure_mihomo(workdir: str) -> str:
         raise SystemExit(f"不支持的平台: {key}")
     url = f"{MIHOMO_BASE}/{asset}"
     arch = os.path.join(workdir, asset)
+    exe = os.path.join(workdir, name)
     download(url, arch)
 
     if asset.endswith(".zip"):
@@ -191,8 +192,8 @@ def ensure_mihomo(workdir: str) -> str:
                     break
         if not found:
             raise SystemExit("zip 解包后找不到 mihomo 可执行文件")
-        exe = os.path.join(workdir, name)
-        shutil.move(found, exe)
+        if found != exe:
+            shutil.move(found, exe)
     else:
         import gzip
 
