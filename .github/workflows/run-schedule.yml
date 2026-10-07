@@ -279,45 +279,59 @@ jobs:
           ./mihomo -d mihomo-work > mihomo-work/mihomo.log 2>&1 &
           sleep 5
 
-          # ---- 等代理端口就绪 ----
-          PORT_OK=0
+          # ---- 等 mihomo 就绪：用本地控制 API（9090）判断，不依赖节点可用性 ----
+          # （订阅头部的「剩余流量」等占位节点不能转发流量，之前用它探测端口永远超时）
+          API_OK=0
           for i in $(seq 1 15); do
-            if curl -x http://127.0.0.1:7897 -s -o /dev/null --max-time 5 https://www.gstatic.com/generate_204; then
-              echo "mihomo 端口 7897 就绪"
-              PORT_OK=1
+            if curl -s --max-time 2 http://127.0.0.1:9090/version 2>/dev/null | grep -q version; then
+              echo "mihomo 已启动（API 就绪）"
+              API_OK=1
               break
             fi
-            # 进程已退出就直接放弃，不用等满 15 轮
-            if ! kill -0 $(pgrep -f "mihomo -d" | head -1) 2>/dev/null; then
+            if ! pgrep -f "mihomo -d" > /dev/null; then
               echo "mihomo 进程已退出"
               break
             fi
             echo "等待 mihomo 启动... ($i/15)"
             sleep 2
           done
-          if [ "$PORT_OK" != "1" ]; then
+          if [ "$API_OK" != "1" ]; then
             echo "::warning::mihomo 启动失败，日志如下（Secret 值已被 GitHub 自动打码）："
             cat mihomo-work/mihomo.log || true
             echo "PROXY_PASS=0" >> $GITHUB_ENV
             exit 0
           fi
 
-          # ---- 连通自检：逐个节点试到 linux.do 返回 200 为止 ----
-          # linux.do 对无 Cookie 的 curl 探测也可能回 403 challenge，
-          # 所以把 200 视为通过；403 也算「可达」（说明没被 429 限流，浏览器能过挑战）
+          # ---- 过滤真实节点：跳过「剩余流量/官网/到期/重置」等占位节点 ----
+          ALL_NODES=$(curl -s http://127.0.0.1:9090/providers/proxies/sub | jq -r '.all[]')
+          REAL_NODES=$(echo "$ALL_NODES" | grep -viE '剩余|流量|官网|到期|重置|expire|traffic|套餐|防失联')
+          REAL_COUNT=$(echo "$REAL_NODES" | grep -c . || true)
+          echo "订阅节点总数 $(echo "$ALL_NODES" | grep -c .)，真实节点候选 $REAL_COUNT"
+          if [ "$REAL_COUNT" = "0" ]; then
+            echo "::warning::订阅里没有真实节点（全是占位信息节点？），检查订阅内容"
+            echo "PROXY_PASS=0" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          # ---- 连通自检：逐个真实节点试到 linux.do 返回 200/403 为止 ----
+          # linux.do 对无 Cookie 的 curl 探测可能回 403 挑战页——也算「可达」
+          # （说明没被 429 限流，浏览器能过挑战）；429/超时则换下一个节点
           PROBE_OK=0
-          for i in $(seq 0 9); do
+          IDX=0
+          while IFS= read -r NODE; do
+            [ -z "$NODE" ] && continue
+            if [ "$IDX" -ge 10 ]; then echo "已试完 10 个节点"; break; fi
+            # 切换 PROXY 组到该节点（9090 API 只在 runner 本地，安全）
+            curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" \
+              -d "$(jq -n --arg n "$NODE" '{name:$n}')" > /dev/null
+            sleep 1
             CODE=$(curl -x http://127.0.0.1:7897 -s -o /dev/null -w '%{http_code}' \
               -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" \
               --max-time 20 https://linux.do/ || echo 000)
-            echo "节点#$i 访问 linux.do -> HTTP $CODE"
+            echo "节点#$IDX [$NODE] 访问 linux.do -> HTTP $CODE"
             if [ "$CODE" = "200" ] || [ "$CODE" = "403" ]; then PROBE_OK=1; break; fi
-            # 切换到 provider 列表里的下一个节点（9090 API 只在 runner 本地，安全）
-            NEXT=$(curl -s "http://127.0.0.1:9090/providers/proxies/sub" | jq -r ".all[$((i+1))] // empty" 2>/dev/null)
-            [ -z "$NEXT" ] && break
-            curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" -d "{\"name\":\"$NEXT\"}" > /dev/null
-            sleep 2
-          done
+            IDX=$((IDX+1))
+          done <<< "$REAL_NODES"
 
           if [ "$PROBE_OK" = "1" ]; then
             echo "PROXY_PASS=1" >> $GITHUB_ENV
