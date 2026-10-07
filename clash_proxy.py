@@ -380,8 +380,10 @@ def main():
             code, cf = probe_linuxdo()
             tag = " [CF挑战]" if cf else ""
             log(f"节点#{i} [{node}] 访问 linux.do -> HTTP {code}{tag}")
-            # 200 = 直达；403+CF挑战 = 节点转发正常，浏览器能过挑战；两者都算通过
-            if code == "200" or (code == "403" and cf):
+            # 仅 000（连不通/超时）与 429（限流）算节点不可用；
+            # 其余任何响应（200 直达、403+CF挑战页、401/5xx 等）都说明
+            # 节点转发正常且没被限流——浏览器拿到页面后可以自己过挑战
+            if code not in ("000", "429"):
                 passed = node
                 break
             if code == "429":
