@@ -316,8 +316,20 @@ def main():
     # 3. mihomo 就绪（本机已装则跳过下载）
     exe = ensure_mihomo(args.workdir)
     logf = open(os.path.join(args.workdir, "mihomo.log"), "w", encoding="utf-8")
+    # 让 mihomo 脱离本次步骤的进程组：CI 里它是"上一步启动、下一步使用"的常驻
+    # 服务，若留在原进程组里，Windows runner 在步骤切换时可能连带终止它。
+    popen_kwargs = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
     proc = subprocess.Popen(
-        [exe, "-d", args.workdir], stdout=logf, stderr=subprocess.STDOUT
+        [exe, "-d", args.workdir],
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        **popen_kwargs,
     )
 
     success = False  # 自检通过才保留进程（CLASH_KEEP_RUNNING=1 时供后续步骤使用）

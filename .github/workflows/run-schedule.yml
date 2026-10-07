@@ -1,11 +1,32 @@
 # ================================================================================
-# Linux.do 自动浏览定时任务（无头 CLI · CloakBrowser）
+# Linux.do 自动浏览定时任务（CloakBrowser 有头运行）
 # ================================================================================
 #
 # 功能：
-#   - 定时/手动在 GitHub Actions 上运行无头命令行版（python main.py cli）
+#   - 定时/手动在 GitHub Actions 上运行命令行版（python main.py cli）
 #   - CloakBrowser 隐身 Chromium 内核自动下载并缓存（约 200MB，首次后走缓存）
 #   - 自动登录（账号密码来自 Secrets）并浏览帖子
+#
+# ================================================================================
+# 为什么默认用 windows-latest 而不是 ubuntu
+# ================================================================================
+#
+# CloakBrowser 在 Linux/Windows 上都会加 `--fingerprint-platform=windows`
+# （它只在 macOS 上不伪装平台，源码注释写明：伪装会造成"字体/GPU 可检测的矛盾"）。
+# 于是在 Linux runner 上：声称是 Windows，却没有 Windows 字体、没有真实 GPU、
+# 时区是 UTC、网络栈是 Linux —— 每一项都与平台声明矛盾，Cloudflare 的 Turnstile
+# 就会一直停在 Verifying… 永不完成（实测 6 个不同国家的机房节点全部如此）。
+#
+# 用 windows-latest 后，"Windows" 这个声明是【真的】：真实系统字体、真实显示
+# 会话（不再需要 Xvfb）、Windows 网络栈 —— 与本机运行环境同类，自洽性最好。
+#
+# 代价与回退：
+#   - 私有仓库 Windows runner 按 2 倍分钟计费（免费额度 2000 分钟/月通常够用）
+#   - 想换回 Linux：把 runs-on 改回 ubuntu-latest 即可，Linux 专用步骤已用
+#     `if: runner.os == 'Linux'` 保护，无需改其它地方
+#
+# 注意：runner 的出口 IP 仍是数据中心段。IP 信誉是 Cloudflare 打分的大头，
+#      这一项只能靠住宅/家宽节点或 Tailscale 回你家网络解决（见 README）。
 #
 # ================================================================================
 # 使用说明
@@ -17,10 +38,11 @@
 # 2. 添加 Secrets（Settings -> Secrets and variables -> Actions -> New repository secret）
 #    - LINUXDO_USERNAME : 你的 Linux.do 用户名（必需）
 #    - LINUXDO_PASSWORD : 你的 Linux.do 密码（必需）
-#    - CLASH_SUB        : 你的 Clash/Clash Verge 订阅链接（推荐！见下方「走代理」说明）
-#    - LINUXDO_PROXY    : 代理地址，如 http://127.0.0.1:7897（不配 CLASH_SUB 时手工指定；留空 = 直连）
-#    - CLOAKBROWSER_LICENSE_KEY : CloakBrowser 许可 key（可选，用于获取最新内核；
-#      免费获取：https://cloakbrowser.dev/free 或 python -m cloakbrowser login）
+#    - CLASH_SUB_CONTENT : 你的 Clash 订阅 YAML「文本内容」（推荐！见下方走代理说明）
+#    - CLASH_SUB        : Clash 订阅链接（机场不拦 CI IP 时才可用）
+#    - LINUXDO_PROXY    : 代理地址，如 http://127.0.0.1:7897（不配订阅时手工指定；留空 = 直连）
+#    - CLOAKBROWSER_LICENSE_KEY : CloakBrowser 许可 key（可选但强烈建议，用于启用
+#      最新内核；免费获取：https://cloakbrowser.dev/free 或 python -m cloakbrowser login）
 #
 # 3. 启用 Actions
 #    Actions -> I understand my workflows, go ahead and enable them
@@ -105,8 +127,15 @@ concurrency:
 
 jobs:
   browse:
-    runs-on: ubuntu-latest
+    # 见文件开头「为什么默认用 windows-latest」。换回 Linux 只改这一行。
+    runs-on: windows-latest
     timeout-minutes: 60  # 最长运行 60 分钟
+
+    # Windows 上 GitHub 默认 shell 是 pwsh，本文件所有 run 脚本都是 bash 写法
+    # （$GITHUB_ENV、数组、[ -z ] 等），因此统一显式声明 bash（runner 自带 git-bash）
+    defaults:
+      run:
+        shell: bash
 
     steps:
       # 检出代码
@@ -132,34 +161,56 @@ jobs:
         run: |
           if [ -n "$CLOAKBROWSER_LICENSE_KEY" ]; then
             echo "CB_LIC=licensed" >> $GITHUB_ENV
-            echo "已配置许可 key -> 使用最新付费级内核"
+            echo "已配置许可 key -> 使用最新内核"
           else
             echo "CB_LIC=free" >> $GITHUB_ENV
             echo "未配置许可 key -> 使用免费内核（过 Cloudflare 能力较弱）"
           fi
 
+      # 算出内核缓存目录（跨平台：Windows 是 C:\Users\...\.cloakbrowser）
+      - name: Resolve CloakBrowser cache dir
+        run: |
+          D="$(python -c "import os;print(os.path.expanduser('~/.cloakbrowser'))")"
+          echo "CB_CACHE_DIR=$D" >> $GITHUB_ENV
+          echo "内核缓存目录: $D"
+
       # 缓存 CloakBrowser 内核（~200MB），避免每次运行重新下载
       # 注意：缓存只在整个 job 成功时才保存——之前反复下载就是因为任务中途失败
-      # key 绑定 cloakbrowser 包版本，升级包后自动换新缓存（可手动改后缀强制刷新）
       - name: Cache CloakBrowser binary
         uses: actions/cache@v4
         with:
-          path: ~/.cloakbrowser
+          path: ${{ env.CB_CACHE_DIR }}
           key: cloakbrowser-${{ runner.os }}-x64-${{ env.CB_LIC }}-v3
+
+      # 缓存浏览器 profile（登录态 + 已通过的 cf_clearance 跨运行累积）。
+      # Cloudflare 对同一浏览器的重复通过会提升信任，每次全新 profile 等于
+      # 每次从零开始挣信誉。排除 debug 截图，避免缓存膨胀。
+      # 安全提示：profile 含登录 cookie，仅存在于本仓库的 Actions 缓存中；
+      # 若仓库转公开或他人有写权限，请删除该缓存（Actions -> Caches）。
+      - name: Cache browser profile
+        uses: actions/cache@v4
+        with:
+          path: |
+            browser_data/**
+            !browser_data/debug/**
+          key: profile-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            profile-${{ runner.os }}-
 
       # 安装项目依赖（CI 上改用官方 PyPI 源，忽略项目里的清华镜像配置）
       - name: Sync dependencies
         run: uv sync --frozen --default-index https://pypi.org/simple
 
-      # 安装 Chromium 运行所需的系统库（必须先于内核安装——
+      # 安装 Chromium 运行所需的系统库（仅 Linux 需要；必须先于内核安装——
       # cloakbrowser install 收尾会启动一次内核自检，缺库时直接 SIGSEGV/exit 139）
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: uv run playwright install-deps chromium
 
-      # 安装字体（CloakBrowser 在 Linux 上伪装 Windows 指纹，
-      # 缺字体会导致 canvas 指纹异常、更容易被风控拦截）
-      # + xvfb：CloakBrowser 需有头模式跑虚拟显示才能过 Cloudflare 交互挑战
-      - name: Install fonts
+      # Linux 才需要补字体（Windows runner 自带真实系统字体，正是我们想要的自洽）
+      # + xvfb：Linux 无显示器，CloakBrowser 需有头模式跑虚拟显示才能过 CF 挑战
+      - name: Install fonts and Xvfb
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
@@ -177,7 +228,9 @@ jobs:
         run: |
           uv run python -m cloakbrowser install || true
           # 缓存里可能同时存在多个版本目录，取版本号最高的（sort -V）
+          # Windows 上二进制名是 chrome.exe，Linux 上是 chrome
           CHROME="$(ls -d "$HOME/.cloakbrowser"/chromium-*/chrome 2>/dev/null | sort -V | tail -1)"
+          [ -z "$CHROME" ] && CHROME="$(ls -d "$HOME/.cloakbrowser"/chromium-*/chrome.exe 2>/dev/null | sort -V | tail -1)"
           if [ -z "$CHROME" ]; then
             echo "::error::CloakBrowser 内核未找到，安装失败"
             exit 1
@@ -187,15 +240,11 @@ jobs:
           uv run python -c 'from cloakbrowser import binary_info; i=binary_info(); print("实际内核: version=%s tier=%s" % (i.get("version"), i.get("tier")))' || true
           # 系统库已就位，这里能跑通即内核可用
           if ! "$CHROME" --version; then
-            echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑；持续失败可把 runs-on 改为 ubuntu-22.04 再试"
+            echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑"
             exit 1
           fi
           echo "内核可正常执行 ✓"
 
-      # ======================================================================
-      # 启动 mihomo（Clash 内核）：把订阅节点搬进 CI，绕开 GitHub 出口 IP 限流
-      # 配了 CLASH_SUB 才启用；跑完后浏览器走 http://127.0.0.1:7897
-      # ======================================================================
       # ======================================================================
       # 启动 mihomo（Clash 内核）：订阅解析/配置/启动/节点自检全在 clash_proxy.py
       # （Python 脚本本机可直接调试：python clash_proxy.py --help）
@@ -225,7 +274,7 @@ jobs:
           fi
           exit 0
 
-      # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
+      # 运行脚本（账号密码走 Secrets 自动登录）
       # 代理优先级：mihomo 自检通过 > LINUXDO_PROXY Secret > 直连
       # PROXY_PASS 由上一步写入 GITHUB_ENV，这里用 shell 变量读取（保证可用）
       - name: Run browse script
@@ -259,20 +308,26 @@ jobs:
 
           echo "========================================"
           echo "开始运行 Linux.do 自动浏览 (CloakBrowser)"
+          echo "运行系统: $RUNNER_OS"
           echo "运行目标: $TARGET（纯数字=帖子数，带单位=时长）"
           echo "点赞概率: $LIKE_RATE%"
           echo "浏览模式: $BROWSE_MODE"
           echo "========================================"
 
-          # 有头模式跑在 Xvfb 虚拟显示上：CloakBrowser 的无头模式会被 Cloudflare
-          # "Just a moment" 交互挑战拦截，官方文档明确要求 headed + Xvfb 过 CF
+          # 有头模式：CloakBrowser 的无头模式会被 Cloudflare "Just a moment"
+          # 挑战拦截。Linux runner 没有显示器，需 Xvfb 虚拟显示；
+          # Windows runner 自带交互式桌面会话，直接有头运行即可。
           ARGS=(--target "$TARGET" --like-rate "$LIKE_RATE" --browse-mode "$BROWSE_MODE" --no-headless)
           if [ -n "$PROXY" ]; then
             ARGS+=(--proxy "$PROXY")
           fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            CMD=(xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run python main.py cli "${ARGS[@]}")
+          else
+            CMD=(uv run python main.py cli "${ARGS[@]}")
+          fi
           # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
-            uv run python main.py cli "${ARGS[@]}"
+          "${CMD[@]}"
 
       # 输出结果摘要（无论成败）
       - name: Summary
@@ -281,6 +336,7 @@ jobs:
           echo "## 运行结果" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 触发方式: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 运行系统: $RUNNER_OS" >> $GITHUB_STEP_SUMMARY
           echo "- 运行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
           echo "- 北京时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_STEP_SUMMARY
 
