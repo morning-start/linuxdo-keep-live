@@ -16,9 +16,11 @@
     - 新增 humanize=True：贝塞尔鼠标轨迹、逐字符键盘输入、拟人滚动
 """
 
+import json
 import os
 import random
 import time
+import urllib.request
 from datetime import datetime
 
 from cloakbrowser import launch_persistent_context
@@ -450,6 +452,10 @@ class Bot:
         self.level_requirements = []  # 保存升级要求
         self.initial_level_info = None  # 保存初始等级信息用于对比
         self.start_time = None  # 记录开始时间
+        # Clash 节点轮换（CI 过 Cloudflare 用）：登录卡挑战时经 mihomo API 换出口 IP 再试
+        self.clash_api = (os.environ.get("CLASH_ROTATE_API") or "").rstrip("/")
+        self._clash_nodes = None
+        self._clash_i = 1  # all[0] 已被 clash_proxy 选中，轮换从下一个开始
 
     # ---------------- 防风控 ----------------
 
@@ -837,12 +843,15 @@ class Bot:
         """
         self.lg("开始登录...")
 
-        max_attempts = 3
+        # 启用 Clash 轮换时多给几次机会（每次换个出口 IP 过 CF）
+        max_attempts = 6 if self.clash_api else 3
         for attempt in range(1, max_attempts + 1):
             try:
                 if attempt > 1:
                     self.lg(f"登录重试（第 {attempt}/{max_attempts} 次）...")
                     self._wait_seconds(3)
+                    # 换一个 Clash 出口节点再试（当前节点 IP 可能被 CF 硬拦）
+                    self._rotate_clash_node()
 
                 # ---- 进入登录界面 ----
                 if self._open_login_ui():
@@ -899,6 +908,43 @@ class Bot:
                 self.lg(f"登录过程出错: {e}")
 
         return False
+
+    def _rotate_clash_node(self):
+        """经 mihomo 控制 API 切换到下一个出口节点。
+
+        登录卡在 Cloudflare 挑战时，换一个 IP 信誉可能更好的节点再试
+        （150 个节点里往往有个别能过 CF）。仅当设置 CLASH_ROTATE_API 时生效。
+
+        Returns:
+            新节点名，或 None（未启用/失败）。
+        """
+        if not self.clash_api:
+            return None
+        try:
+            if self._clash_nodes is None:
+                raw = json.loads(
+                    urllib.request.urlopen(f"{self.clash_api}/proxies/PROXY", timeout=5).read()
+                )
+                self._clash_nodes = [
+                    n for n in (raw.get("all") or []) if n not in ("DIRECT", "REJECT", "PROXY")
+                ]
+            if not self._clash_nodes:
+                return None
+            name = self._clash_nodes[self._clash_i % len(self._clash_nodes)]
+            self._clash_i += 1
+            req = urllib.request.Request(
+                f"{self.clash_api}/proxies/PROXY",
+                method="PUT",
+                data=json.dumps({"name": name}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5).read()
+            self.lg(f"切换 Clash 出口节点 -> {name}")
+            self._wait_seconds(1)
+            return name
+        except Exception as e:
+            self.lg(f"切换 Clash 节点失败: {e}")
+            return None
 
     def _wait_cf_clear(self, timeout_s=60):
         """Cloudflare 挑战页出现时，等待 CloakBrowser 自动通过。

@@ -148,10 +148,12 @@ python prepare_sub_secret.py "https://你的订阅链接"   # 或直接传 Verge
 - 注意 `timeout-minutes: 60`：`--target` 设为超过 1 小时的时长会被强制截断
 - 登录失败自动重试 3 次，并在 `browser_data/debug/` 留下截图 + 页面快照（失败时作为 artifact 上传，可下载排查）
 
-**风控提示**：GitHub Actions 的 IP 是数据中心共享段，linux.do 对其限流严重——首次登录常见失败是站点直接返回 HTTP 429（日志里「正文开头='Too Many Requests'」或截图白底一行字即是）。程序会识别限流页并等 60s 长退避后重试；若三次重试仍被限流，**推荐配置 `CLASH_SUB_CONTENT` Secret 走你的 Clash 订阅**（见下），其余选项：
+**风控提示（两道坎）**：GitHub Actions 的出口 IP 是数据中心共享段，会先后遇到两个坎：
 
-1. 配置 `LINUXDO_PROXY` Secret 指向一个云端可达的代理（VPS/住宅代理服务）
-2. 改为本地/Docker 运行（家宽 IP 信誉好得多）
+1. **HTTP 429 限流**：linux.do 直接拒绝，登录页不渲染。→ 用 Clash 订阅换出口 IP 解决（见下）
+2. **Cloudflare "Just a moment" 交互挑战**：换 IP 后能访问了，但 CF 对数据中心 IP 弹人机验证。→ 本项目的应对：CI 用 **Xvfb 有头模式**跑 CloakBrowser（无头模式过不了 CF），登录流程遇到挑战页会**静默等待自动通过、绝不刷新**（刷新会重置挑战）。若仍卡住，强烈建议配 `CLOAKBROWSER_LICENSE_KEY` Secret 启用**最新 v152 内核**（免费获取：`python -m cloakbrowser login` 或 <https://cloakbrowser.dev/free>）——旧免费二进制 v146 的 CF 补丁较少，过挑战成功率明显更低。
+
+若三次重试仍失败，其余选项：配置 `LINUXDO_PROXY` 走住宅代理，或改为本地/Docker 运行（家宽 IP 信誉好得多）。
 
 **在 Actions 里用你的 Clash 订阅（推荐）**：GitHub 的 runner 无法访问你电脑上的 Clash（`127.0.0.1` 是 runner 自己），所以 workflow 会调用 [clash_proxy.py](clash_proxy.py)（订阅解析 → mihomo 配置生成/启动 → 节点自检，全在一个 Python 脚本里，**本机可直接调试**：`python clash_proxy.py --help`），每次运行时：
 

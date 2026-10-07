@@ -211,6 +211,8 @@ jobs:
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY }}
+          # 登录卡 Cloudflare 挑战时，bot 经此 API 换 Clash 出口节点再试（仅走代理时有意义）
+          CLASH_ROTATE_API: http://127.0.0.1:9090
           CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
           CLOAKBROWSER_SUPPRESS_FONT_WARNING: '1'
           PYTHONUNBUFFERED: '1'
