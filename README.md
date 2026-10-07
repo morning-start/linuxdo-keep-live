@@ -113,9 +113,9 @@ python main.py docker -u 用户名 -p 密码 --once
 
 每次任务浏览随机数量的帖子（默认 15-40），配合随机时间点，最大程度模拟真人使用习惯。
 
-### GitHub Actions 定时版（云端无头运行）
+### GitHub Actions 定时版（云端运行）
 
-仓库自带 [`.github/workflows/run-schedule.yml`](.github/workflows/run-schedule.yml)：在 GitHub 的服务器上定时/手动运行无头 CLI，本机无需开机。
+仓库自带 [`.github/workflows/run-schedule.yml`](.github/workflows/run-schedule.yml)：在 GitHub 的服务器上定时/手动运行命令行版，本机无需开机。默认跑在 **`windows-latest`** 上（原因见下方风控提示——Linux runner 的指纹与 CloakBrowser 的 Windows 平台声明必然矛盾，会被 Cloudflare 卡死）。
 
 ```bash
 # 1. Fork 本仓库并设为私有（Settings -> Danger Zone -> Make private）
@@ -155,13 +155,17 @@ python prepare_sub_secret.py "https://你的订阅链接"   # 或直接传 Verge
 
 本项目针对第 2 坎已做的（都在代码/工作流里，无需你配置）：
 
-- CI 用 **Xvfb 有头模式**运行（无头模式 CF 直接拦）
+- **CI 跑在 `windows-latest` 上**：CloakBrowser 在 Linux/Windows 都会加 `--fingerprint-platform=windows`（它只在 macOS 上不伪装平台，源码注释写明伪装会造成"字体/GPU 可检测矛盾"）。Linux runner 声称 Windows 却没有 Windows 字体/真实 GPU/UTC 时区/Linux 网络栈，Turnstile 会一直停在 `Verifying…`；Windows runner 上这些声明是**真的**，与本机同类
+- 有头模式运行（无头模式 CF 直接拦）。Windows runner 自带桌面会话，无需 Xvfb；若改回 `ubuntu-latest`，workflow 会自动装 Xvfb 并有头跑在虚拟显示上
 - 遇到挑战页**静默等待、绝不刷新**（刷新会重置托管挑战进度）
 - 判定"已通过"要求**正向内容证据且连续两次稳定**——只看"没有挑战特征"会在 Turnstile 跳转的一瞬间误判成通过
 - **登录阶段不挂任何请求拦截**：`ctx.route("**/*")` 会把 `challenges.cloudflare.com` 的请求也改写重发，足以让挑战永远转圈；图片屏蔽改到登录成功后再启用
 - 走代理时用 `--fingerprint-webrtc-ip` 把 **WebRTC 伪装成代理出口 IP**，避免 HTTP 走节点 IP、WebRTC 却报出 runner 真实 IP 这种自证代理的组合
 - **换节点后重建浏览器**并清 cookie：`cf_clearance` 与签发它的 IP 强绑定，留着旧 IP 的 cookie 去新 IP 只会再触发挑战
 - 卡挑战时自动轮换出口节点，且**跨列表分散取样**（订阅里节点按地区成组，连续取 6 个会全落在同一批机房）
+- **缓存浏览器 profile**（`browser_data`）：登录态与已通过的 `cf_clearance` 跨运行累积。每次全新 profile 等于每次从零开始挣信誉
+
+> 实测记录：在 Linux runner 上，跨保加利亚 / 爱尔兰(AWS) / 法国 / 德国(Hetzner) / 美国(Zenlayer) 等 6 个不同机房 ASN 全部卡在同一个 `Verifying…`——说明**换节点解决不了环境自洽性问题**。
 
 仍然卡住时，只有两个变量在代码之外，按性价比排序：
 
