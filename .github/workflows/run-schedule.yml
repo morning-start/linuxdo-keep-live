@@ -135,11 +135,8 @@ jobs:
       - name: Sync dependencies
         run: uv sync --frozen --default-index https://pypi.org/simple
 
-      # 下载 CloakBrowser 隐身 Chromium 内核（已缓存则跳过下载）
-      - name: Install CloakBrowser binary
-        run: uv run python -m cloakbrowser install
-
-      # 安装 Chromium 运行所需的系统库（playwright 会通过 apt 安装）
+      # 安装 Chromium 运行所需的系统库（必须先于内核安装——
+      # cloakbrowser install 收尾会启动一次内核自检，缺库时直接 SIGSEGV/exit 139）
       - name: Install system dependencies
         run: uv run playwright install-deps chromium
 
@@ -151,6 +148,25 @@ jobs:
           sudo apt-get install -y -qq \
             fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
             fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
+
+      # 下载 CloakBrowser 隐身 Chromium 内核（已缓存则跳过下载）
+      # install 自检历史上出现过 exit 139（段错误）——下载/校验其实已完成，
+      # 故容错后单独验证二进制可执行，避免环境小问题炸掉整个任务
+      - name: Install CloakBrowser binary
+        run: |
+          uv run python -m cloakbrowser install || true
+          CHROME="$(ls "$HOME/.cloakbrowser"/chromium-*/chrome 2>/dev/null | head -1)"
+          if [ -z "$CHROME" ]; then
+            echo "::error::CloakBrowser 内核未找到，安装失败"
+            exit 1
+          fi
+          echo "找到内核: $CHROME"
+          # 系统库已就位，这里能跑通即内核可用
+          if ! "$CHROME" --version; then
+            echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑；持续失败可把 runs-on 改为 ubuntu-22.04 再试"
+            exit 1
+          fi
+          echo "内核可正常执行 ✓"
 
       # ======================================================================
       # 启动 mihomo（Clash 内核）：把订阅节点搬进 CI，绕开 GitHub 出口 IP 限流
