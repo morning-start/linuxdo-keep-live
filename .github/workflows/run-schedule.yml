@@ -173,10 +173,16 @@ jobs:
       # 启动 mihomo（Clash 内核）：把订阅节点搬进 CI，绕开 GitHub 出口 IP 限流
       # 配了 CLASH_SUB 才启用；跑完后浏览器走 http://127.0.0.1:7897
       # ======================================================================
+      # ======================================================================
+      # 启动 mihomo（Clash 内核）：订阅解析/配置/启动/节点自检全在 clash_proxy.py
+      # （Python 脚本本机可直接调试：python clash_proxy.py --help）
+      # 退出码 0 = 代理自检通过（mihomo 常驻供浏览步骤用）；非 0 = 降级直连（任务不失败）
+      # ======================================================================
       - name: Setup Clash proxy (mihomo)
         env:
           CLASH_SUB: ${{ secrets.CLASH_SUB }}
           CLASH_SUB_CONTENT: ${{ secrets.CLASH_SUB_CONTENT }}
+          CLASH_KEEP_RUNNING: '1'   # 自检通过后 mihomo 常驻，供浏览步骤走 127.0.0.1:7897
         run: |
           # 未配置任何订阅时跳过（secrets 不能用于 if 条件，这里在 shell 里判断）
           if [ -z "$CLASH_SUB" ] && [ -z "$CLASH_SUB_CONTENT" ]; then
@@ -184,190 +190,26 @@ jobs:
             echo "PROXY_PASS=0" >> $GITHUB_ENV
             exit 0
           fi
+          set +e
+          uv run python clash_proxy.py
+          RC=$?
           set -e
-          # ---- 下载 mihomo 内核（固定版本，保证可复现） ----
-          MIHOMO_VER="v1.19.32"
-          curl -sL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VER}/mihomo-linux-amd64-${MIHOMO_VER}.gz" -o mihomo.gz
-          gunzip -f mihomo.gz && chmod +x mihomo
-          ./mihomo -v
-
-          mkdir -p mihomo-work
-          # ---- 准备节点源：优先用订阅内容（CI 拉订阅常被机场的 Cloudflare 拦 403） ----
-          if [ -n "$CLASH_SUB_CONTENT" ]; then
-            echo "模式: 使用 CLASH_SUB_CONTENT（订阅内容直接注入，不经网络）"
-            # Secret 粘贴的内容可能有 CRLF / BOM，规范化后写入，base64 兜底防排版损坏
-            printf '%s' "$CLASH_SUB_CONTENT" | tr -d '\r' | sed -e '1s/^\xEF\xBB\xBF//' > mihomo-work/sub-content.yaml
-            if ! grep -q "proxies:" mihomo-work/sub-content.yaml; then
-              # 粘贴可能丢换行导致 YAML 损坏；内容疑似 base64 时尝试解码
-              echo "内容里没有 proxies: 字段，尝试按 base64 解码..."
-              if printf '%s' "$CLASH_SUB_CONTENT" | tr -d '\r\n ' | base64 -d 2>/dev/null | grep -q "proxies:"; then
-                printf '%s' "$CLASH_SUB_CONTENT" | tr -d '\r\n ' | base64 -d > mihomo-work/sub-content.yaml
-                echo "base64 解码成功"
-              else
-                echo "::error::CLASH_SUB_CONTENT 内容无效：既不是含 proxies: 的 YAML，也不是 base64 订阅。请重新复制完整订阅文件内容"
-                echo "PROXY_PASS=0" >> $GITHUB_ENV
-                exit 0
-              fi
-            fi
-            PROVIDER_TYPE="file"
-            PROVIDER_SRC="sub-content.yaml"
-          else
-            echo "模式: 使用 CLASH_SUB 订阅链接"
-            # ---- 预检订阅链接：常见复制错误在这里就能发现 ----
-            if [[ "$CLASH_SUB" == clash://* ]]; then
-              echo "::error::CLASH_SUB 填的是 clash:// 一键导入链接，请改填原始订阅地址（https:// 开头，Clash Verge 里「编辑订阅」可看到真实 URL）；或改用 CLASH_SUB_CONTENT 直接贴订阅内容"
-              echo "PROXY_PASS=0" >> $GITHUB_ENV
-              exit 0
-            fi
-            if [[ "$CLASH_SUB" != https://* && "$CLASH_SUB" != http://* ]]; then
-              echo "::error::CLASH_SUB 不是有效的 http(s) 订阅链接（当前前缀: ${CLASH_SUB:0:8}...）"
-              echo "PROXY_PASS=0" >> $GITHUB_ENV
-              exit 0
-            fi
-            SUB_CODE=$(curl -sL -o /tmp/sub_probe.yaml -w '%{http_code}' --max-time 20 \
-              -A "clash-verge/v1.7.7" "$CLASH_SUB" || echo 000)
-            SUB_SIZE=$(wc -c < /tmp/sub_probe.yaml 2>/dev/null || echo 0)
-            echo "订阅预检: HTTP $SUB_CODE, ${SUB_SIZE} 字节"
-            if [ "$SUB_CODE" != "200" ] || [ "$SUB_SIZE" -lt 50 ]; then
-              echo "::error::订阅链接拉取失败（HTTP $SUB_CODE）——机场的 Cloudflare 大概率拦截了 CI 的数据中心 IP。请改用 CLASH_SUB_CONTENT：本机浏览器打开订阅链接下载 .yaml，全选复制内容粘进 Secret"
-              echo "PROXY_PASS=0" >> $GITHUB_ENV
-              exit 0
-            fi
-            PROVIDER_TYPE="http"
-            PROVIDER_SRC="$CLASH_SUB"
-          fi
-
-          # ---- 生成最小配置：本地 mixed 端口 7897 + 订阅作为 provider ----
-          # 规则模式 + MATCH 全走 PROXY 组；不启用 TUN/系统代理，仅本地端口
-          # （用 printf 逐行写入，避免 heredoc 结束符与 YAML 块标量缩进冲突）
-          {
-            echo 'mixed-port: 7897'
-            echo 'allow-lan: false'
-            echo 'mode: rule'
-            echo 'log-level: info'
-            echo 'external-controller: 127.0.0.1:9090'
-            echo 'proxy-providers:'
-            echo '  sub:'
-            echo "    type: $PROVIDER_TYPE"
-            if [ "$PROVIDER_TYPE" = "file" ]; then
-              echo "    path: $PROVIDER_SRC"
-            else
-              echo "    url: \"$PROVIDER_SRC\""
-              echo '    header:'
-              echo '      User-Agent:'
-              echo '        - clash-verge/v1.7.7'
-            fi
-            echo '    interval: 86400'
-            echo '    health-check:'
-            echo '      enable: true'
-            echo '      url: https://www.gstatic.com/generate_204'
-            echo '      interval: 300'
-            echo 'proxy-groups:'
-            echo '  - name: PROXY'
-            echo '    type: select'
-            echo '    use:'
-            echo '      - sub'
-            echo 'rules:'
-            echo '  - MATCH,PROXY'
-          } > mihomo-work/config.yaml
-          # http 模式下订阅链接替换进配置（文件在 runner 本地，不打印内容）
-          # 用 perl 而非 sed：订阅 URL 常含 & 等字符，sed 替换串里 & 是特殊字符会写坏链接
-          if [ "$PROVIDER_TYPE" = "http" ]; then
-            CLASH_SUB="$CLASH_SUB" perl -pe 's/CLASH_SUB_PLACEHOLDER/$ENV{CLASH_SUB}/g' -i mihomo-work/config.yaml
-          fi
-
-          # ---- 启动内核（后台常驻） ----
-          ./mihomo -d mihomo-work > mihomo-work/mihomo.log 2>&1 &
-          sleep 5
-
-          # ---- 等 mihomo 就绪：用本地控制 API（9090）判断，不依赖节点可用性 ----
-          # （订阅头部的「剩余流量」等占位节点不能转发流量，之前用它探测端口永远超时）
-          API_OK=0
-          for i in $(seq 1 15); do
-            if curl -s --max-time 2 http://127.0.0.1:9090/version 2>/dev/null | grep -q version; then
-              echo "mihomo 已启动（API 就绪）"
-              API_OK=1
-              break
-            fi
-            if ! pgrep -f "mihomo -d" > /dev/null; then
-              echo "mihomo 进程已退出"
-              break
-            fi
-            echo "等待 mihomo 启动... ($i/15)"
-            sleep 2
-          done
-          if [ "$API_OK" != "1" ]; then
-            echo "::warning::mihomo 启动失败，日志如下（Secret 值已被 GitHub 自动打码）："
-            cat mihomo-work/mihomo.log || true
-            echo "PROXY_PASS=0" >> $GITHUB_ENV
-            exit 0
-          fi
-
-          # ---- 过滤真实节点：跳过「剩余流量/官网/到期/重置」等占位节点 ----
-          # provider 名不一定是 "sub"（file 类型可能注册为 default），先动态发现
-          PROVIDER=$(curl -s http://127.0.0.1:9090/providers/proxies \
-            | jq -r '.providers | to_entries[] | select(.key != "compatible") | .key' | head -1)
-          [ -z "$PROVIDER" ] && PROVIDER="sub"
-          echo "使用 provider: $PROVIDER"
-          ALL_NODES=$(curl -s "http://127.0.0.1:9090/providers/proxies/$PROVIDER" | jq -r '.all[]? // empty')
-          if [ -z "$ALL_NODES" ]; then
-            # 兜底：不区分 provider，从 PROXY 组里拿节点列表
-            echo "provider 接口未取到节点，改从 PROXY 组读取..."
-            ALL_NODES=$(curl -s http://127.0.0.1:9090/proxies/PROXY | jq -r '.all[]? // empty')
-          fi
-          if [ -z "$ALL_NODES" ]; then
-            echo "::warning::9090 API 取不到节点列表，跳过过滤直接用默认节点"
-            echo "PROXY_PASS=0" >> $GITHUB_ENV
-            exit 0
-          fi
-          REAL_NODES=$(echo "$ALL_NODES" | grep -viE '剩余|流量|官网|到期|重置|expire|traffic|套餐|防失联' || true)
-          REAL_COUNT=$(echo "$REAL_NODES" | grep -c . || true)
-          echo "订阅节点总数 $(echo "$ALL_NODES" | grep -c .)，真实节点候选 $REAL_COUNT"
-          if [ "$REAL_COUNT" = "0" ]; then
-            echo "::warning::过滤后没有真实节点，退回全量节点"
-            REAL_NODES="$ALL_NODES"
-            REAL_COUNT=$(echo "$ALL_NODES" | grep -c . || true)
-          fi
-
-          # ---- 连通自检：逐个真实节点试到 linux.do 返回 200/403 为止 ----
-          # linux.do 对无 Cookie 的 curl 探测可能回 403 挑战页——也算「可达」
-          # （说明没被 429 限流，浏览器能过挑战）；429/超时则换下一个节点
-          PROBE_OK=0
-          IDX=0
-          while IFS= read -r NODE; do
-            [ -z "$NODE" ] && continue
-            if [ "$IDX" -ge 10 ]; then echo "已试完 10 个节点"; break; fi
-            # 切换 PROXY 组到该节点（9090 API 只在 runner 本地，安全）
-            BODY=$(jq -n --arg n "$NODE" '{name:$n}') \
-              && curl -s -X PUT "http://127.0.0.1:9090/proxies/PROXY" -d "$BODY" > /dev/null \
-              || { echo "切换节点失败，跳过"; IDX=$((IDX+1)); continue; }
-            sleep 1
-            CODE=$(curl -x http://127.0.0.1:7897 -s -o /dev/null -w '%{http_code}' \
-              -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36" \
-              --max-time 20 https://linux.do/ || echo 000)
-            echo "节点#$IDX [$NODE] 访问 linux.do -> HTTP $CODE"
-            if [ "$CODE" = "200" ] || [ "$CODE" = "403" ]; then PROBE_OK=1; break; fi
-            IDX=$((IDX+1))
-          done <<< "$REAL_NODES"
-
-          if [ "$PROBE_OK" = "1" ]; then
+          if [ "$RC" -eq 0 ]; then
             echo "PROXY_PASS=1" >> $GITHUB_ENV
-            echo "✅ 代理自检通过，浏览任务将走 Clash 节点"
           else
             echo "PROXY_PASS=0" >> $GITHUB_ENV
-            echo "::warning::代理自检未通过（所有节点都无法打开 linux.do），日志如下："
-            tail -n 30 mihomo-work/mihomo.log || true
-            echo "::warning::浏览任务将直连重试"
+            echo "::warning::代理自检未通过（退出码 $RC），浏览任务将直连重试"
           fi
+          exit 0
 
       # 运行脚本（无头模式，账号密码走 Secrets 自动登录）
       # 代理优先级：mihomo 自检通过 > LINUXDO_PROXY Secret > 直连
+      # PROXY_PASS 由上一步写入 GITHUB_ENV，这里用 shell 变量读取（保证可用）
       - name: Run browse script
         env:
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           LINUXDO_PROXY: ${{ secrets.LINUXDO_PROXY }}
-          CLASH_PROXY_PASS: ${{ env.PROXY_PASS }}
           CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
           CLOAKBROWSER_SUPPRESS_FONT_WARNING: '1'
           PYTHONUNBUFFERED: '1'
@@ -379,7 +221,7 @@ jobs:
 
           # 代理决策：mihomo 自检通过则强制走本地 7897；
           # 未通过但配置了 LINUXDO_PROXY 则用用户的代理；否则直连
-          if [ "${CLASH_PROXY_PASS}" = "1" ]; then
+          if [ "${PROXY_PASS:-0}" = "1" ]; then
             PROXY="http://127.0.0.1:7897"
             echo "走代理: mihomo (127.0.0.1:7897, 自检通过)"
           elif [ -n "${LINUXDO_PROXY}" ]; then

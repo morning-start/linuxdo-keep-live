@@ -120,14 +120,22 @@ python main.py docker -u 用户名 -p 密码 --once
 ```bash
 # 1. Fork 本仓库并设为私有（Settings -> Danger Zone -> Make private）
 # 2. 添加 Secrets（Settings -> Secrets and variables -> Actions）：
-#      LINUXDO_USERNAME  用户名（必需）
-#      LINUXDO_PASSWORD  密码（必需）
-#      CLASH_SUB         Clash 订阅链接（推荐，见下方风控提示；不填 = 直连）
-#      LINUXDO_PROXY     代理地址（可选，配了 CLASH_SUB 就不用填）
+#      LINUXDO_USERNAME     用户名（必需）
+#      LINUXDO_PASSWORD     密码（必需）
+#      CLASH_SUB_CONTENT    订阅内容（推荐，见下方风控提示；不填 = 直连）
+#      CLASH_SUB            订阅链接（备选，仅当机场不拦 CI 的 IP 时可用）
+#      LINUXDO_PROXY        代理地址（可选，以上两个都不配时用）
 #      CLOAKBROWSER_LICENSE_KEY  CloakBrowser key（可选，免费获取见上文）
 # 3. Actions 页启用 workflows，然后 Run Schedule -> Run workflow 手动触发；
 #    「运行目标」填纯数字 = 浏览 N 帖（如 30），带单位 = 时长（如 30min / 1h）；
 #    定时触发默认每天 UTC 1:00（北京时间 9:00），每次跑 30min，改 cron 在 yml 里调
+```
+
+准备订阅内容 Secret（一行命令，自动裁掉无关配置并复制到剪贴板）：
+
+```bash
+python prepare_sub_secret.py "https://你的订阅链接"   # 或直接传 Verge profiles 目录下的 .yaml
+# 产物 sub_secret_content.txt（~20KB，避开 Secret 48KB 上限）→ 网页粘贴到 CLASH_SUB_CONTENT
 ```
 
 工作流细节：
@@ -140,18 +148,19 @@ python main.py docker -u 用户名 -p 密码 --once
 - 注意 `timeout-minutes: 60`：`--target` 设为超过 1 小时的时长会被强制截断
 - 登录失败自动重试 3 次，并在 `browser_data/debug/` 留下截图 + 页面快照（失败时作为 artifact 上传，可下载排查）
 
-**风控提示**：GitHub Actions 的 IP 是数据中心共享段，linux.do 对其限流严重——首次登录常见失败是站点直接返回 HTTP 429（日志里「正文开头='Too Many Requests'」或截图白底一行字即是）。程序会识别限流页并等 60s 长退避后重试；若三次重试仍被限流，**推荐配置 `CLASH_SUB` Secret 走你的 Clash 订阅**（见下），其余选项：
+**风控提示**：GitHub Actions 的 IP 是数据中心共享段，linux.do 对其限流严重——首次登录常见失败是站点直接返回 HTTP 429（日志里「正文开头='Too Many Requests'」或截图白底一行字即是）。程序会识别限流页并等 60s 长退避后重试；若三次重试仍被限流，**推荐配置 `CLASH_SUB_CONTENT` Secret 走你的 Clash 订阅**（见下），其余选项：
 
 1. 配置 `LINUXDO_PROXY` Secret 指向一个云端可达的代理（VPS/住宅代理服务）
 2. 改为本地/Docker 运行（家宽 IP 信誉好得多）
 
-**在 Actions 里用你的 Clash 订阅（推荐）**：GitHub 的 runner 无法访问你电脑上的 Clash（`127.0.0.1` 是 runner 自己），所以 workflow 内置了 mihomo（Clash 内核）启动步骤——把订阅链接存成 Secret `CLASH_SUB`，每次运行时 runner 会自动：
+**在 Actions 里用你的 Clash 订阅（推荐）**：GitHub 的 runner 无法访问你电脑上的 Clash（`127.0.0.1` 是 runner 自己），所以 workflow 会调用 [clash_proxy.py](clash_proxy.py)（订阅解析 → mihomo 配置生成/启动 → 节点自检，全在一个 Python 脚本里，**本机可直接调试**：`python clash_proxy.py --help`），每次运行时：
 
-1. 下载 mihomo 内核（固定版本），用你的订阅拉取节点，起本地代理 `127.0.0.1:7897`
-2. 自检：逐个节点试访问 linux.do，被 429 就自动切下一个节点（最多试 10 个）
-3. 自检通过后浏览器走该节点出去（相当于把你电脑的 Clash 搬进 CI）；全部节点不通则降级直连并在日志告警
+1. 订阅来源二选一：`CLASH_SUB_CONTENT`（内容直接注入，**推荐**——很多机场用 Cloudflare 拦 CI 的数据中心 IP，拉链接会 403）或 `CLASH_SUB`（链接，预检 403 会明确报错）
+2. 下载 mihomo 内核（固定版本）起本地代理 `127.0.0.1:7897`，用控制 API 确认就绪
+3. 过滤掉「剩余流量/到期」等占位节点后，逐个真实节点试访问 linux.do（200 直达或 403+CF 挑战页都算通，被 429 自动换下一个，最多试 10 个）
+4. 自检通过后浏览器走该节点出去（相当于把你电脑的 Clash 搬进 CI）；全部不通则降级直连并在日志告警
 
-订阅链接等同密码（内含服务器凭据），只放 Secrets；工作流不会把它打印到日志。
+订阅链接/内容等同密码（内含服务器凭据），只放 Secrets；工作流不会把它打印到日志。
 
 ### 代理怎么配（重要）
 

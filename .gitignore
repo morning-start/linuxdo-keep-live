@@ -14,3 +14,5 @@ browser_data/
 
 # 订阅内容临时文件（含节点凭据，不要提交）
 sub_secret_content.txt
+mihomo-work/
+mihomo-test/
