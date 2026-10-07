@@ -143,11 +143,12 @@ jobs:
 
       # 安装字体（CloakBrowser 在 Linux 上伪装 Windows 指纹，
       # 缺字体会导致 canvas 指纹异常、更容易被风控拦截）
+      # + xvfb：CloakBrowser 需有头模式跑虚拟显示才能过 Cloudflare 交互挑战
       - name: Install fonts
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
+            xvfb fonts-noto-color-emoji fonts-freefont-ttf fonts-unifont \
             fonts-ipafont-gothic fonts-wqy-zenhei fonts-tlwg-loma-otf
 
       # 下载 CloakBrowser 隐身 Chromium 内核（已缓存则跳过下载）
@@ -239,19 +240,15 @@ jobs:
           echo "浏览模式: $BROWSE_MODE"
           echo "========================================"
 
-          # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
+          # 有头模式跑在 Xvfb 虚拟显示上：CloakBrowser 的无头模式会被 Cloudflare
+          # "Just a moment" 交互挑战拦截，官方文档明确要求 headed + Xvfb 过 CF
+          ARGS=(--target "$TARGET" --like-rate "$LIKE_RATE" --browse-mode "$BROWSE_MODE" --no-headless)
           if [ -n "$PROXY" ]; then
-            uv run python main.py cli \
-              --target "$TARGET" \
-              --like-rate "$LIKE_RATE" \
-              --browse-mode "$BROWSE_MODE" \
-              --proxy "$PROXY"
-          else
-            uv run python main.py cli \
-              --target "$TARGET" \
-              --like-rate "$LIKE_RATE" \
-              --browse-mode "$BROWSE_MODE"
+            ARGS+=(--proxy "$PROXY")
           fi
+          # 浏览 0 个帖子时退出码为 1，任务标记失败以便收到通知
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+            uv run python main.py cli "${ARGS[@]}"
 
       # 输出结果摘要（无论成败）
       - name: Summary
