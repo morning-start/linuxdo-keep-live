@@ -150,10 +150,25 @@ python prepare_sub_secret.py "https://你的订阅链接"   # 或直接传 Verge
 
 **风控提示（两道坎）**：GitHub Actions 的出口 IP 是数据中心共享段，会先后遇到两个坎：
 
-1. **HTTP 429 限流**：linux.do 直接拒绝，登录页不渲染。→ 用 Clash 订阅换出口 IP 解决（见下）
-2. **Cloudflare "Just a moment" 交互挑战**：换 IP 后能访问了，但 CF 对数据中心 IP 弹人机验证。→ 本项目的应对：CI 用 **Xvfb 有头模式**跑 CloakBrowser（无头模式过不了 CF），登录流程遇到挑战页会**静默等待自动通过、绝不刷新**（刷新会重置挑战）。若仍卡住，强烈建议配 `CLOAKBROWSER_LICENSE_KEY` Secret 启用**最新 v152 内核**（免费获取：`python -m cloakbrowser login` 或 <https://cloakbrowser.dev/free>）——旧免费二进制 v146 的 CF 补丁较少，过挑战成功率明显更低。
+1. **HTTP 429 限流**：linux.do 直接拒绝，登录页不渲染。→ 已由 Clash 订阅解决（见下），日志里 `走代理: mihomo` + 真实出口 IP 可核对
+2. **Cloudflare Turnstile 托管挑战**：页面卡在 `Just a moment...`，截图是转圈的 `Verifying...`。这是**自动验证没有完成**，不是"过了又被拦"——`cf_clearance` 从未签发
 
-若三次重试仍失败，其余选项：配置 `LINUXDO_PROXY` 走住宅代理，或改为本地/Docker 运行（家宽 IP 信誉好得多）。
+本项目针对第 2 坎已做的（都在代码/工作流里，无需你配置）：
+
+- CI 用 **Xvfb 有头模式**运行（无头模式 CF 直接拦）
+- 遇到挑战页**静默等待、绝不刷新**（刷新会重置托管挑战进度）
+- 判定"已通过"要求**正向内容证据且连续两次稳定**——只看"没有挑战特征"会在 Turnstile 跳转的一瞬间误判成通过
+- **登录阶段不挂任何请求拦截**：`ctx.route("**/*")` 会把 `challenges.cloudflare.com` 的请求也改写重发，足以让挑战永远转圈；图片屏蔽改到登录成功后再启用
+- 走代理时用 `--fingerprint-webrtc-ip` 把 **WebRTC 伪装成代理出口 IP**，避免 HTTP 走节点 IP、WebRTC 却报出 runner 真实 IP 这种自证代理的组合
+- **换节点后重建浏览器**并清 cookie：`cf_clearance` 与签发它的 IP 强绑定，留着旧 IP 的 cookie 去新 IP 只会再触发挑战
+- 卡挑战时自动轮换出口节点，且**跨列表分散取样**（订阅里节点按地区成组，连续取 6 个会全落在同一批机房）
+
+仍然卡住时，只有两个变量在代码之外，按性价比排序：
+
+1. **配 `CLOAKBROWSER_LICENSE_KEY` Secret**（免费：`python -m cloakbrowser login` 或 <https://cloakbrowser.dev/free>）启用最新内核。免费内核 Cloudflare 补丁明显更少。注意 key 必须传到**下载内核那一步**才有效——工作流已同时传给 install 与运行步骤，并按 `free`/`licensed` 分开缓存，日志会打印 `实际内核: version=... tier=...` 供你确认生效
+2. **换住宅/家宽（ISP/原生）出口节点**：Cloudflare 打分主要看 IP 信誉，纯机房 IP 的订阅（哪怕换了国家）通过率都很低
+
+保底方案：本地/Docker 运行（家宽 IP 信誉好得多，实测不触发挑战），用 Windows 任务计划程序定时即可。
 
 **在 Actions 里用你的 Clash 订阅（推荐）**：GitHub 的 runner 无法访问你电脑上的 Clash（`127.0.0.1` 是 runner 自己），所以 workflow 会调用 [clash_proxy.py](clash_proxy.py)（订阅解析 → mihomo 配置生成/启动 → 节点自检，全在一个 Python 脚本里，**本机可直接调试**：`python clash_proxy.py --help`），每次运行时：
 
