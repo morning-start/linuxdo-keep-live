@@ -23,7 +23,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-from cloakbrowser import launch_persistent_context
+from cloakbrowser import binary_info, launch_persistent_context
 
 # ==================== JS 片段（自参考项目移植） ====================
 
@@ -504,6 +504,21 @@ class Bot:
             time.sleep(1)  # 等待浏览器完全关闭
 
         self.lg("启动浏览器 (CloakBrowser)...")
+        try:
+            info = binary_info()
+            tier = info.get("tier")
+            self.lg(
+                f"内核: Chromium {info.get('version')}（{tier}）"
+                + ("" if tier == "free" else " ✓ 最新内核，过 Cloudflare 能力更强")
+            )
+            if tier == "free":
+                self.lg(
+                    "提示: 免费内核的 Cloudflare 补丁较少。配置 Secret "
+                    "CLOAKBROWSER_LICENSE_KEY（https://cloakbrowser.dev/free 免费获取）"
+                    "可启用最新内核，过挑战率明显更高"
+                )
+        except Exception:
+            pass
 
         # 重试机制（处理偶发启动失败，如首次下载/端口占用/profile 锁残留）
         max_retries = 3
@@ -1016,7 +1031,11 @@ class Bot:
                 ]
             if not self._clash_nodes:
                 return None
-            name = self._clash_nodes[self._clash_i % len(self._clash_nodes)]
+            # 跨列表步长取样，而不是从头连续取：订阅里的节点往往按地区成组排列，
+            # 连续取 6 个会全落在同一批欧洲机房，换 IP 等于没换信誉池。
+            n = len(self._clash_nodes)
+            stride = max(1, n // 12) if n > 12 else 1
+            name = self._clash_nodes[(self._clash_i * stride) % n]
             self._clash_i += 1
             req = urllib.request.Request(
                 f"{self.clash_api}/proxies/PROXY",

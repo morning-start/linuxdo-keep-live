@@ -123,6 +123,21 @@ jobs:
       - name: Install uv
         run: python -m pip install --upgrade uv
 
+      # 检测是否配置了 CloakBrowser 许可 key。
+      # 有 key 用的是最新内核（CF 补丁更多、过挑战率更高），与免费内核是两个
+      # 不同的二进制，必须用不同的缓存 key，否则会复用旧缓存而"看起来没生效"。
+      - name: Detect CloakBrowser license
+        env:
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
+        run: |
+          if [ -n "$CLOAKBROWSER_LICENSE_KEY" ]; then
+            echo "CB_LIC=licensed" >> $GITHUB_ENV
+            echo "已配置许可 key -> 使用最新付费级内核"
+          else
+            echo "CB_LIC=free" >> $GITHUB_ENV
+            echo "未配置许可 key -> 使用免费内核（过 Cloudflare 能力较弱）"
+          fi
+
       # 缓存 CloakBrowser 内核（~200MB），避免每次运行重新下载
       # 注意：缓存只在整个 job 成功时才保存——之前反复下载就是因为任务中途失败
       # key 绑定 cloakbrowser 包版本，升级包后自动换新缓存（可手动改后缀强制刷新）
@@ -130,7 +145,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cloakbrowser
-          key: cloakbrowser-${{ runner.os }}-x64-v2
+          key: cloakbrowser-${{ runner.os }}-x64-${{ env.CB_LIC }}-v3
 
       # 安装项目依赖（CI 上改用官方 PyPI 源，忽略项目里的清华镜像配置）
       - name: Sync dependencies
@@ -155,14 +170,21 @@ jobs:
       # install 自检历史上出现过 exit 139（段错误）——下载/校验其实已完成，
       # 故容错后单独验证二进制可执行，避免环境小问题炸掉整个任务
       - name: Install CloakBrowser binary
+        env:
+          # 必须在这一步就传入：内核是 install 时下载的，
+          # 只在运行步骤传 key 会照样装了免费内核
+          CLOAKBROWSER_LICENSE_KEY: ${{ secrets.CLOAKBROWSER_LICENSE_KEY }}
         run: |
           uv run python -m cloakbrowser install || true
-          CHROME="$(ls "$HOME/.cloakbrowser"/chromium-*/chrome 2>/dev/null | head -1)"
+          # 缓存里可能同时存在多个版本目录，取版本号最高的（sort -V）
+          CHROME="$(ls -d "$HOME/.cloakbrowser"/chromium-*/chrome 2>/dev/null | sort -V | tail -1)"
           if [ -z "$CHROME" ]; then
             echo "::error::CloakBrowser 内核未找到，安装失败"
             exit 1
           fi
           echo "找到内核: $CHROME"
+          # 打印实际使用的内核版本与层级，便于确认许可 key 是否生效
+          uv run python -c 'from cloakbrowser import binary_info; i=binary_info(); print("实际内核: version=%s tier=%s" % (i.get("version"), i.get("tier")))' || true
           # 系统库已就位，这里能跑通即内核可用
           if ! "$CHROME" --version; then
             echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑；持续失败可把 runs-on 改为 ubuntu-22.04 再试"
