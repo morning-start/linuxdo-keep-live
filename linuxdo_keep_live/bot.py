@@ -846,6 +846,10 @@ class Bot:
 
                 # ---- 进入登录界面 ----
                 if self._open_login_ui():
+                    # Cloudflare 挑战页：给 CloakBrowser 时间自动通过。
+                    # 关键：挑战解析期间【绝不刷新】——刷新会重置挑战，永远过不了。
+                    self._wait_cf_clear(timeout_s=60)
+
                     # ---- 等待登录表单出现 ----
                     if not self._wait_login_form():
                         reason = self._rate_limited_or_challenge()
@@ -858,7 +862,10 @@ class Bot:
                                 continue
                             self.lg("多次重试仍被限流，任务终止")
                             return False
-                        self.lg("登录表单未出现（可能被风控页拦截），重试...")
+                        if reason == "challenge":
+                            self.lg("仍卡在 Cloudflare 挑战页，重试（节点 IP 信誉可能较差）...")
+                        else:
+                            self.lg("登录表单未出现（可能被风控页拦截），重试...")
                         continue
 
                     # ---- 填表并提交 ----
@@ -892,6 +899,36 @@ class Bot:
                 self.lg(f"登录过程出错: {e}")
 
         return False
+
+    def _wait_cf_clear(self, timeout_s=60):
+        """Cloudflare 挑战页出现时，等待 CloakBrowser 自动通过。
+
+        关键原则：挑战解析期间【绝不刷新页面】——刷新会重置 CF 的托管挑战进度，
+        导致永远过不了。这里只静默轮询标题/特征，给内核足够时间自行完成验证。
+
+        Returns:
+            True  挑战已通过（或本就没有挑战）
+            False 超时仍卡在挑战页
+        """
+        deadline = time.time() + timeout_s
+        seen = False
+        while self.run and time.time() < deadline:
+            diag = self._page_diag()
+            title = (diag.get("title") or "").lower()
+            challenging = (
+                bool(diag.get("cf"))
+                or "just a moment" in title
+                or "checking your browser" in title
+            )
+            if not challenging:
+                if seen:
+                    self.lg("Cloudflare 挑战已通过")
+                return True
+            if not seen:
+                self.lg(f"检测到 Cloudflare 挑战页，等待自动通过（不刷新，最长 {timeout_s}s）...")
+                seen = True
+            time.sleep(2)
+        return not self._page_diag().get("cf")
 
     def _rate_limited_or_challenge(self):
         """判断当前页面是限流页（HTTP 429）还是其他风控拦截
