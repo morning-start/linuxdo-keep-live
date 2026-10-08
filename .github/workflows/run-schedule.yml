@@ -137,6 +137,12 @@ jobs:
       run:
         shell: bash
 
+    env:
+      # Windows runner 的 stdout 默认是 cp1252，Python print 中文会直接
+      # UnicodeEncodeError 崩掉（bot 全程中文日志，必须强制 UTF-8）
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: 'utf-8'
+
     steps:
       # 检出代码
       - name: Checkout
@@ -238,12 +244,23 @@ jobs:
           echo "找到内核: $CHROME"
           # 打印实际使用的内核版本与层级，便于确认许可 key 是否生效
           uv run python -c 'from cloakbrowser import binary_info; i=binary_info(); print("实际内核: version=%s tier=%s" % (i.get("version"), i.get("tier")))' || true
-          # 系统库已就位，这里能跑通即内核可用
-          if ! "$CHROME" --version; then
-            echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑"
-            exit 1
+          # 验证内核可用。注意 Windows 上 chrome.exe 不支持 --version——
+          # 它会把浏览器当 GUI 启动并一直阻塞（上次就是卡在这被 60min 超时取消的），
+          # 因此 Windows 只验证文件存在且非空；Linux 才真正执行一次
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            if [ ! -s "$CHROME" ]; then
+              echo "::error::内核二进制为空或缺失: $CHROME"
+              exit 1
+            fi
+            SIZE="$(wc -c <"$CHROME" | tr -d ' ')"
+            echo "内核文件就绪（$SIZE 字节）✓"
+          else
+            if ! "$CHROME" --version; then
+              echo "::error::内核二进制无法运行（段错误）。请到 Actions -> Caches 删除 cloakbrowser-* 后重跑"
+              exit 1
+            fi
+            echo "内核可正常执行 ✓"
           fi
-          echo "内核可正常执行 ✓"
 
       # ======================================================================
       # 启动 mihomo（Clash 内核）：订阅解析/配置/启动/节点自检全在 clash_proxy.py
